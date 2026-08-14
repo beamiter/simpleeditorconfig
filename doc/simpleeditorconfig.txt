@@ -1,0 +1,14 @@
+*simpleeditorconfig.txt*  Local and remote EditorConfig for Vim9
+
+:SimpleEditorConfigReload   Re-read configuration for the current buffer.
+:SimpleEditorConfigInfo     Show sources and effective properties.
+:SimpleEditorConfigHealth   Show integration health.
+
+Supported properties: indent_style, indent_size, tab_width, end_of_line,
+charset, trim_trailing_whitespace, insert_final_newline and max_line_length.
+Section globs support *, **, ?, character classes and comma braces.
+
+SimpleRemote buffers are discovered asynchronously through
+g:SimpleRemoteReadFile().
+
+vim:tw=78:ts=8:noet:ft=help:norl:
