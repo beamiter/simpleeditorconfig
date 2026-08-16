@@ -466,12 +466,18 @@ enddef
 #
 # A stale .editorconfig is worse than reading one again, so an entry is reused
 # only when the file's mtime and size are still exactly what they were when it
-# was read — and it is not stored at all while that mtime is the current second.
-# getftime() has one-second resolution, so a write landing in the same second as
-# our read would otherwise be invisible for as long as the session lives, which
-# is exactly the sequence "edit .editorconfig, save, open a file to see what it
-# did".  Once the second has passed, any later write must produce a different
-# mtime, and the entry falls out on its own.
+# was read — and it is not stored at all until that mtime is safely in the
+# past.  getftime() has one-second resolution, so a write landing in the same
+# second as our read would otherwise be invisible for as long as the session
+# lives, which is exactly the sequence "edit .editorconfig, save, open a file
+# to see what it did".  "Safely" is two seconds rather than one because the
+# clock a filesystem stamps files with and the one localtime() reads do not
+# tick over at the same instant: on the same host they are known to disagree
+# by a few milliseconds around a second boundary, and a stamp that is a second
+# ahead of localtime() is what turned "not the current second" into a stale
+# entry that lived for the rest of the session.  Once the margin has passed,
+# any later write must produce a different mtime, and the entry falls out on
+# its own.
 var s_parsed: dict<dict<any>> = {}
 
 def ParseFile(file: string): dict<any>
@@ -482,13 +488,19 @@ def ParseFile(file: string): dict<any>
     return cached.parsed
   endif
   var parsed = Parse(readfile(file))
-  if ftime != localtime()
+  if localtime() - ftime >= 2
     s_parsed[file] = {ftime: ftime, size: size, parsed: parsed}
   endif
   return parsed
 enddef
 
-def LocalConfigs(path: string): list<dict<any>>
+# Walk from the file's directory towards the filesystem root, or towards
+# `stop` when one is given: a projected SimpleRemote workspace (sshfs,
+# docker-bind) is a mount of the remote root, and what sits above the mount
+# point — ~/.local/state, ~/.editorconfig — belongs to this machine, not to
+# the project.  Reading it would give a remote file properties its own
+# repository never asked for.
+def LocalConfigs(path: string, stop: string = ''): list<dict<any>>
   var configs: list<dict<any>> = []
   var dir = fnamemodify(path, ':h')
   while !empty(dir)
@@ -500,6 +512,9 @@ def LocalConfigs(path: string): list<dict<any>>
         break
       endif
     endif
+    if dir ==# stop
+      break
+    endif
     var parent = fnamemodify(dir, ':h')
     if parent ==# dir
       break
@@ -507,6 +522,110 @@ def LocalConfigs(path: string): list<dict<any>>
     dir = parent
   endwhile
   return reverse(configs)
+enddef
+
+# The local root of a projected workspace when `path` sits under it, or ''.
+# local-map is left out on purpose: that mode maps the workspace onto a
+# directory the user chose on this machine — a checkout of the same project,
+# typically — and a checkout inherits its surroundings like any local file.
+def ProjectionRoot(path: string): string
+  var workspace = get(g:, 'simpleremote_workspace', {})
+  if type(workspace) != v:t_dict || get(workspace, 'mode', '') ==# 'local-map'
+    return ''
+  endif
+  var local_root = get(workspace, 'local_root', '')
+  if type(local_root) != v:t_string || empty(local_root)
+    return ''
+  endif
+  local_root = substitute(resolve(fnamemodify(local_root, ':p')), '/\+$', '', '')
+  if empty(local_root)
+    local_root = '/'
+  endif
+  var prefix = local_root ==# '/' ? '/' : local_root .. '/'
+  if path !=# local_root && stridx(path, prefix) != 0
+    return ''
+  endif
+  return local_root
+enddef
+
+# Remote .editorconfig files, parsed, keyed by workspace id and remote path.
+# Every remote:// buffer a project opens walks the same directories up to
+# the same workspace root, and each directory used to cost one agent
+# round-trip — the file at depth d paid d of them, serially, before its
+# options landed.  A miss is cached as well as a hit, because most
+# directories have no .editorconfig and "not there" is the answer that is
+# asked for most.
+#
+# There is no mtime to check against as there is for the local cache, so the
+# entries are dropped whenever something is known to have changed them: a
+# remote:// buffer saving a .editorconfig (BufWritePost), a tree or API
+# mutation touching one (SimpleRemoteFilesChanged), the workspace being
+# swapped for another (SimpleRemoteWorkspaceChanged) or going away
+# (SimpleRemoteDisconnected), and :SimpleEditorConfigReload, which is the
+# user asking for a re-read.  The workspace id in the key keeps a reconnect
+# from ever seeing the previous connection's answers.
+var s_remote_parsed: dict<dict<any>> = {}
+
+def RemoteKey(workspace: dict<any>, file: string): string
+  return string(get(workspace, 'id', '')) .. ':' .. file
+enddef
+
+def RemoteFile(dir: string): string
+  return (dir ==# '/' ? '' : dir) .. '/.editorconfig'
+enddef
+
+# Drop every cached remote .editorconfig.
+export def ForgetRemote()
+  s_remote_parsed = {}
+enddef
+
+# Drop the cached entries a change to `paths` may have touched: a
+# .editorconfig itself, or a directory that was created, renamed or deleted
+# with .editorconfig files somewhere under it.
+def ForgetRemotePaths(paths: list<string>)
+  if empty(s_remote_parsed)
+    return
+  endif
+  for path in paths
+    if type(path) != v:t_string || empty(path)
+      continue
+    endif
+    if path =~# '/\.editorconfig$' || path ==# '.editorconfig'
+      s_remote_parsed = {}
+      return
+    endif
+    var prefix = substitute(path, '/\+$', '', '') .. '/'
+    for key in keys(s_remote_parsed)
+      var file = strpart(key, stridx(key, ':') + 1)
+      if stridx(file, prefix) == 0
+        remove(s_remote_parsed, key)
+      endif
+    endfor
+  endfor
+enddef
+
+# The directories whose .editorconfig may apply to `path`: its own, then each
+# parent, up to and including the workspace root — never above it, that is
+# not the project.
+def RemoteDirs(path: string, root: string): list<string>
+  var dirs: list<string> = []
+  var dir = fnamemodify(path, ':h')
+  var prefix = root ==# '/' ? '/' : root .. '/'
+  if dir !=# root && stridx(dir, prefix) != 0
+    return dirs
+  endif
+  while true
+    add(dirs, dir)
+    if dir ==# root
+      break
+    endif
+    var parent = fnamemodify(dir, ':h')
+    if parent ==# dir || strlen(parent) < strlen(root)
+      break
+    endif
+    dir = parent
+  endwhile
+  return dirs
 enddef
 
 def FinishRemote(buf: number, path: string, configs: list<dict<any>>, token: number)
@@ -518,30 +637,84 @@ def FinishRemote(buf: number, path: string, configs: list<dict<any>>, token: num
     mapnew(ordered, (_, config) => config.path))
 enddef
 
-def RemoteStep(buf: number, path: string, dir: string, root: string,
-    configs: list<dict<any>>, token: number)
-  if !bufexists(buf) || getbufvar(buf, 'simpleeditorconfig_token', -1) != token
+# Once every directory has answered, keep the configs from the file's own
+# directory up to the first one that says `root = true` and apply them.
+def MaybeFinish(state: dict<any>)
+  if state.done || state.answered < len(state.dirs)
     return
   endif
-  var file = (dir ==# '/' ? '' : dir) .. '/.editorconfig'
-  g:SimpleRemoteReadFile(file, (ok, body) => {
-    var stop = false
-    if ok
-      var parsed = Parse(split(body, "\n", 1))
-      add(configs, {dir: dir, path: file, parsed: parsed})
-      stop = parsed.root
+  state.done = true
+  var configs: list<dict<any>> = []
+  for idx in range(len(state.dirs))
+    var entry = state.results[idx]
+    if !entry.ok
+      continue
     endif
-    if stop || dir ==# root
-      FinishRemote(buf, path, configs, token)
+    add(configs, {dir: state.dirs[idx], path: RemoteFile(state.dirs[idx]),
+      parsed: entry.parsed})
+    if entry.parsed.root
+      break
+    endif
+  endfor
+  FinishRemote(state.buf, state.path, configs, state.token)
+enddef
+
+# One directory's answer.  The agent's "no such file" reply is `not a file:
+# <path>`; every other failure — connection closed, workspace not ready,
+# request timed out, cannot read — means the walk did not see the whole
+# picture, and applying the part it did see (a child config without the root
+# config it builds on) would replace the buffer's baseline with something
+# incoherent.  Leaving the buffer alone is the better outcome.
+def OnRead(state: dict<any>, idx: number, ok: bool, body: string)
+  if state.done
+    return
+  endif
+  if !ok && body !~# '^not a file:'
+    state.done = true
+    return
+  endif
+  var entry = {ok: ok, parsed: ok ? Parse(split(body, "\n", 1)) : {}}
+  s_remote_parsed[RemoteKey(state.workspace, RemoteFile(state.dirs[idx]))] = entry
+  state.results[idx] = entry
+  state.answered += 1
+  MaybeFinish(state)
+enddef
+
+# A named function so the closure captures this call's `idx` and nothing
+# else.  Returns false when the read could not even be issued.
+def IssueRead(state: dict<any>, idx: number): bool
+  var file = RemoteFile(state.dirs[idx])
+  return g:SimpleRemoteReadFile(file, (ok, body) =>
+    OnRead(state, idx, !!ok, type(body) == v:t_string ? body : string(body))) >= 0
+enddef
+
+# Ask for every candidate .editorconfig at once — the reads are independent,
+# so a file at depth d costs one round-trip instead of d — answering the
+# ones already cached on the spot.
+def Collect(buf: number, path: string, dirs: list<string>,
+    workspace: dict<any>, token: number)
+  var state: dict<any> = {buf: buf, path: path, dirs: dirs, token: token,
+    workspace: workspace, results: repeat([{}], len(dirs)), answered: 0,
+    done: false}
+  for idx in range(len(dirs))
+    var cached = get(s_remote_parsed, RemoteKey(workspace, RemoteFile(dirs[idx])), {})
+    if !empty(cached)
+      state.results[idx] = cached
+      state.answered += 1
+    endif
+  endfor
+  for idx in range(len(dirs))
+    if !empty(state.results[idx])
+      continue
+    endif
+    if !IssueRead(state, idx) || state.done
+      # Refused outright, or an earlier synchronous failure already ended the
+      # walk: nothing is applied.
+      state.done = true
       return
     endif
-    var parent = fnamemodify(dir, ':h')
-    if parent ==# dir || strlen(parent) < strlen(root)
-      FinishRemote(buf, path, configs, token)
-      return
-    endif
-    RemoteStep(buf, path, parent, root, configs, token)
-  })
+  endfor
+  MaybeFinish(state)
 enddef
 
 def ApplyRemote(buf: number, path: string)
@@ -550,6 +723,9 @@ def ApplyRemote(buf: number, path: string)
     return
   endif
   var workspace = get(g:, 'simpleremote_workspace', {})
+  if type(workspace) != v:t_dict
+    workspace = {}
+  endif
   var root = substitute(get(workspace, 'root', ''), '/\+$', '', '')
   if root ==# ''
     root = '/'
@@ -561,7 +737,7 @@ def ApplyRemote(buf: number, path: string)
   s_generation += 1
   var token = s_generation
   setbufvar(buf, 'simpleeditorconfig_token', token)
-  RemoteStep(buf, path, fnamemodify(path, ':h'), root, [], token)
+  Collect(buf, path, RemoteDirs(path, root), workspace, token)
 enddef
 
 export def Apply(buf: number = bufnr())
@@ -579,15 +755,49 @@ export def Apply(buf: number = bufnr())
     return
   endif
   var path = resolve(fnamemodify(name, ':p'))
-  var configs = LocalConfigs(path)
+  var configs = LocalConfigs(path, ProjectionRoot(path))
   ApplyProperties(buf, Effective(configs, path),
     mapnew(configs, (_, config) => config.path))
+enddef
+
+# :SimpleEditorConfigReload — the user asking for a fresh read, so the cached
+# remote answers are dropped first; the local cache checks mtimes itself.
+export def Reload(buf: number = bufnr())
+  ForgetRemote()
+  Apply(buf)
 enddef
 
 export def ApplyRemoteEvent()
   var event = get(g:, 'simpleremote_event', {})
   if get(event, 'type', '') ==# 'buffer-read'
     Apply(get(event, 'bufnr', -1))
+  endif
+enddef
+
+# User SimpleRemoteFilesChanged: a tree, upload or API mutation.  Only a
+# change that can have touched a .editorconfig costs anything.
+export def OnRemoteFilesChanged()
+  var event = get(g:, 'simpleremote_event', {})
+  var changes = get(event, 'changes', [])
+  if type(changes) != v:t_list
+    return
+  endif
+  var paths: list<string> = []
+  for change in changes
+    if type(change) == v:t_dict && type(get(change, 'path', '')) == v:t_string
+      add(paths, get(change, 'path', ''))
+    endif
+  endfor
+  ForgetRemotePaths(paths)
+enddef
+
+# BufWritePost: a remote:// buffer that saved a .editorconfig has just made
+# the cached copy of it stale.  Local .editorconfig files are covered by the
+# mtime check in ParseFile().
+export def AfterWrite()
+  var remote = get(b:, 'vimrc_remote', {})
+  if type(remote) == v:t_dict && get(remote, 'path', '') =~# '/\.editorconfig$'
+    ForgetRemotePaths([remote.path])
   endif
 enddef
 
@@ -606,9 +816,35 @@ export def BeforeWrite()
   endif
 enddef
 
+# How the current buffer relates to the SimpleRemote workspace, for Info().
+def WorkspaceLine(): string
+  var workspace = get(g:, 'simpleremote_workspace', {})
+  if type(workspace) != v:t_dict || empty(workspace)
+    return ''
+  endif
+  var label = exists('*g:SimpleRemoteStatusline') ? g:SimpleRemoteStatusline() : ''
+  if empty(label)
+    label = get(workspace, 'kind', '') .. ':' .. get(workspace, 'target', '')
+  endif
+  var remote = get(b:, 'vimrc_remote', {})
+  var relation = 'local'
+  if type(remote) == v:t_dict && !empty(get(remote, 'path', ''))
+    relation = 'remote'
+  elseif &buftype ==# '' && !empty(bufname())
+      && !empty(ProjectionRoot(resolve(fnamemodify(bufname(), ':p'))))
+    relation = 'projected'
+  endif
+  return printf('%s mode=%s buffer=%s', label,
+    get(workspace, 'mode', 'virtual'), relation)
+enddef
+
 export def Info()
   var properties = get(b:, 'simpleeditorconfig', {})
   echomsg $'SimpleEditorConfig: {bufname()}'
+  var workspace = WorkspaceLine()
+  if !empty(workspace)
+    echomsg '  workspace: ' .. workspace
+  endif
   for source in get(b:, 'simpleeditorconfig_sources', [])
     echomsg '  source: ' .. source
   endfor
@@ -621,5 +857,8 @@ export def Health()
   echomsg 'SimpleEditorConfig health'
   echomsg $'  enabled: {get(g:, "simpleeditorconfig_enable", 1) ? "yes" : "no"}'
   echomsg $'  remote reads: {exists("*g:SimpleRemoteReadFile") ? "available" : "absent"}'
+  var workspace = WorkspaceLine()
+  echomsg '  workspace: ' .. (empty(workspace) ? 'none' : workspace)
+  echomsg $'  remote cache: {len(s_remote_parsed)} file(s)'
   echomsg $'  sources: {len(get(b:, "simpleeditorconfig_sources", []))}'
 enddef

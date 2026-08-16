@@ -5,6 +5,15 @@ const ROOT = fnamemodify(resolve(expand('<sfile>:p')), ':h:h')
 execute 'set runtimepath^=' .. fnameescape(ROOT)
 execute 'source ' .. fnameescape(ROOT .. '/plugin/simpleeditorconfig.vim')
 
+def WaitFor(Cond: func(): bool, timeout: number = 3000): bool
+  var waited = 0
+  while !Cond() && waited < timeout
+    sleep 10m
+    waited += 10
+  endwhile
+  return Cond()
+enddef
+
 const BASE = tempname()
 mkdir(BASE .. '/src/nested', 'p')
 writefile([
@@ -36,49 +45,325 @@ assert_equal(2, len(b:simpleeditorconfig_sources))
 simpleeditorconfig#BeforeWrite()
 assert_equal('print("ok")', getline(1))
 
+# ---------------------------------------------------------------------------
+# Virtual-mode remote:// buffers.  g:SimpleRemoteReadFile is stubbed the way
+# SimpleRemote answers: (ok, body) with the agent's `not a file: <path>` for a
+# missing file, or a synchronous failure and -1 when no workspace is ready.
+# The stub answers on the spot unless g:remote_async asks for a timer, so both
+# the synchronous and the asynchronous shape of the callback are exercised.
 g:remote_editorconfigs = {
   '/workspace/.editorconfig': join([
     'root = true', '[*]', 'indent_style = tab', 'tab_width = 8',
+    'trim_trailing_whitespace = true',
   ], "\n"),
   '/workspace/src/.editorconfig': join([
     '[*.py]', 'indent_style = space', 'indent_size = 2',
   ], "\n"),
 }
 g:remote_editorconfig_reads = []
+g:remote_async = false
+g:remote_fail = {}
+g:remote_refuse = false
 def g:SimpleRemoteReadFile(path: string, Callback: func): number
   add(g:remote_editorconfig_reads, path)
-  if has_key(g:remote_editorconfigs, path)
-    call(Callback, [true, g:remote_editorconfigs[path]])
+  if g:remote_refuse
+    call(Callback, [false, 'remote workspace is not ready'])
+    return -1
+  endif
+  var ok = !!has_key(g:remote_editorconfigs, path)
+  var body = ok ? g:remote_editorconfigs[path] : 'not a file: ' .. path
+  if has_key(g:remote_fail, path)
+    ok = false
+    body = g:remote_fail[path]
+  endif
+  if g:remote_async
+    timer_start(5, (_) => call(Callback, [ok, body]))
   else
-    call(Callback, [false, 'not found'])
+    call(Callback, [ok, body])
   endif
   return 1
 enddef
-g:simpleremote_workspace = {root: '/workspace'}
-enew!
-setlocal buftype=acwrite filetype=python
-silent file remote:///workspace/src/lib/main.py
-b:vimrc_remote = {path: '/workspace/src/lib/main.py'}
-g:simpleremote_event = {type: 'buffer-read', bufnr: bufnr(),
-  path: b:vimrc_remote.path, workspace: copy(g:simpleremote_workspace)}
-doautocmd <nomodeline> User SimpleRemoteBufferRead
+def g:SimpleRemoteStatusline(): string
+  return 'ssh:devbox:workspace@12ms'
+enddef
+
+def RemoteBuffer(path: string, ftype: string = 'python'): number
+  enew!
+  setlocal buftype=acwrite
+  execute 'setlocal filetype=' .. ftype
+  execute 'silent file remote://' .. path
+  b:vimrc_remote = {path: path, uri: 'remote://' .. path, generation: 1}
+  return bufnr()
+enddef
+
+def FireBufferRead(buf: number)
+  g:simpleremote_event = {event: 'SimpleRemoteBufferRead', type: 'buffer-read',
+    bufnr: buf, path: getbufvar(buf, 'vimrc_remote').path,
+    workspace: copy(g:simpleremote_workspace), status: 'ssh:devbox',
+    time: localtime()}
+  doautocmd <nomodeline> User SimpleRemoteBufferRead
+enddef
+
+def Fire(event: string, payload: dict<any>)
+  g:simpleremote_event = extend(copy(payload),
+    {event: event, status: 'ssh:devbox', time: localtime()})
+  execute 'doautocmd <nomodeline> User ' .. event
+enddef
+
+g:simpleremote_workspace = {id: 1, kind: 'ssh', target: 'devbox',
+  root: '/workspace', tree_root: '/workspace', local_root: '', mode: 'virtual'}
+RemoteBuffer('/workspace/src/lib/main.py')
+FireBufferRead(bufnr())
 assert_true(&l:expandtab)
 assert_equal(2, &l:shiftwidth)
 assert_equal(8, &l:tabstop)
 assert_equal([
   '/workspace/.editorconfig', '/workspace/src/.editorconfig',
 ], b:simpleeditorconfig_sources)
+# Every candidate directory is asked at once, the file's own first, the
+# workspace root last, and nothing above the root.
+assert_equal([
+  '/workspace/src/lib/.editorconfig',
+  '/workspace/src/.editorconfig',
+  '/workspace/.editorconfig',
+], g:remote_editorconfig_reads)
+
+# SimpleRemote fires BufWritePre from its BufWriteCmd, so a remote save runs
+# BeforeWrite() like a local one: trim_trailing_whitespace must reach the
+# acwrite buffer through the autocmd, not only through a direct call.
+setline(1, ['import os   ', 'print(os.name)  '])
+doautocmd <nomodeline> BufWritePre
+assert_equal(['import os', 'print(os.name)'], getline(1, '$'))
+setlocal nomodified
+
+# A second buffer in the same directory is answered from the cache: no reads.
+var reads_before = len(g:remote_editorconfig_reads)
+RemoteBuffer('/workspace/src/lib/other.py')
+FireBufferRead(bufnr())
+assert_equal(reads_before, len(g:remote_editorconfig_reads),
+  'cached remote .editorconfig files must not be read again')
+assert_equal(2, &l:shiftwidth)
+assert_equal([
+  '/workspace/.editorconfig', '/workspace/src/.editorconfig',
+], b:simpleeditorconfig_sources)
+
+# A deeper file reuses the cached parents and reads only what is new.
+reads_before = len(g:remote_editorconfig_reads)
+RemoteBuffer('/workspace/src/lib/deep/x.py')
+FireBufferRead(bufnr())
+assert_equal(['/workspace/src/lib/deep/.editorconfig'],
+  g:remote_editorconfig_reads[reads_before :])
+assert_equal(2, &l:shiftwidth)
 
 # A lexical prefix is not a workspace child: /workspace2 must never inherit
 # /workspace configuration or trigger remote reads for the active workspace.
-var reads_before = len(g:remote_editorconfig_reads)
-enew!
-setlocal buftype=acwrite filetype=python shiftwidth=6
-silent file remote:///workspace2/src/main.py
-b:vimrc_remote = {path: '/workspace2/src/main.py'}
+reads_before = len(g:remote_editorconfig_reads)
+RemoteBuffer('/workspace2/src/main.py')
+setlocal shiftwidth=6
 simpleeditorconfig#Apply(bufnr())
 assert_equal(reads_before, len(g:remote_editorconfig_reads))
 assert_equal(6, &l:shiftwidth)
+
+# Saving a .editorconfig from a remote:// buffer makes the cached copy stale:
+# BufWritePost drops it and the next buffer sees the new contents.
+g:remote_editorconfigs['/workspace/src/.editorconfig'] = join([
+  '[*.py]', 'indent_style = space', 'indent_size = 3',
+], "\n")
+reads_before = len(g:remote_editorconfig_reads)
+RemoteBuffer('/workspace/src/lib/stale.py')
+FireBufferRead(bufnr())
+assert_equal(2, &l:shiftwidth, 'the cache is still authoritative until told otherwise')
+assert_equal(reads_before, len(g:remote_editorconfig_reads))
+RemoteBuffer('/workspace/src/.editorconfig', 'editorconfig')
+setline(1, split(g:remote_editorconfigs['/workspace/src/.editorconfig'], "\n"))
+setlocal nomodified
+doautocmd <nomodeline> BufWritePost
+reads_before = len(g:remote_editorconfig_reads)
+RemoteBuffer('/workspace/src/lib/fresh.py')
+FireBufferRead(bufnr())
+assert_equal(3, &l:shiftwidth, 'a saved .editorconfig must be re-read')
+assert_true(len(g:remote_editorconfig_reads) > reads_before)
+
+# SimpleRemoteFilesChanged: a change that cannot have touched a .editorconfig
+# costs nothing; one naming a .editorconfig, or a directory holding one, drops
+# what may be stale.
+reads_before = len(g:remote_editorconfig_reads)
+Fire('SimpleRemoteFilesChanged', {changes: [
+  {path: '/workspace/src/lib/main.py', type: 'changed'}],
+  workspace: copy(g:simpleremote_workspace)})
+RemoteBuffer('/workspace/src/lib/a.py')
+FireBufferRead(bufnr())
+assert_equal(reads_before, len(g:remote_editorconfig_reads),
+  'an unrelated change must not empty the cache')
+Fire('SimpleRemoteFilesChanged', {changes: [
+  {path: '/workspace/src', type: 'deleted'}],
+  workspace: copy(g:simpleremote_workspace)})
+reads_before = len(g:remote_editorconfig_reads)
+RemoteBuffer('/workspace/src/lib/b.py')
+FireBufferRead(bufnr())
+assert_equal([
+  '/workspace/src/lib/.editorconfig', '/workspace/src/.editorconfig',
+], g:remote_editorconfig_reads[reads_before :],
+  'a deleted directory drops the entries under it and keeps the root')
+Fire('SimpleRemoteFilesChanged', {changes: [
+  {path: '/workspace/.editorconfig', type: 'created'}],
+  workspace: copy(g:simpleremote_workspace)})
+reads_before = len(g:remote_editorconfig_reads)
+RemoteBuffer('/workspace/src/lib/c.py')
+FireBufferRead(bufnr())
+assert_equal(3, len(g:remote_editorconfig_reads) - reads_before,
+  'a created .editorconfig drops the whole cache')
+
+# SimpleRemoteWorkspaceChanged and SimpleRemoteDisconnected empty the cache.
+Fire('SimpleRemoteWorkspaceChanged', {snapshot: copy(g:simpleremote_workspace)})
+reads_before = len(g:remote_editorconfig_reads)
+RemoteBuffer('/workspace/src/lib/d.py')
+FireBufferRead(bufnr())
+assert_equal(3, len(g:remote_editorconfig_reads) - reads_before)
+Fire('SimpleRemoteDisconnected', {reason: 'reconnect'})
+reads_before = len(g:remote_editorconfig_reads)
+RemoteBuffer('/workspace/src/lib/e.py')
+FireBufferRead(bufnr())
+assert_equal(3, len(g:remote_editorconfig_reads) - reads_before)
+
+# :SimpleEditorConfigReload is the user asking for a fresh read.
+reads_before = len(g:remote_editorconfig_reads)
+SimpleEditorConfigReload
+assert_equal(3, len(g:remote_editorconfig_reads) - reads_before)
+assert_equal(3, &l:shiftwidth)
+
+# The walk is cut at the first `root = true`, whatever was read above it.
+g:remote_editorconfigs['/workspace/src/.editorconfig'] = join([
+  'root = true', '[*.py]', 'indent_style = space', 'indent_size = 5',
+], "\n")
+simpleeditorconfig#ForgetRemote()
+RemoteBuffer('/workspace/src/lib/rooted.py')
+FireBufferRead(bufnr())
+assert_equal(['/workspace/src/.editorconfig'], b:simpleeditorconfig_sources)
+assert_equal(5, &l:shiftwidth)
+assert_equal(5, &l:tabstop, 'tab_width above the root must not apply')
+g:remote_editorconfigs['/workspace/src/.editorconfig'] = join([
+  '[*.py]', 'indent_style = space', 'indent_size = 3',
+], "\n")
+
+# A transport failure is not "no .editorconfig": a walk that did not see the
+# whole picture applies nothing rather than a partial, incoherent set.
+simpleeditorconfig#ForgetRemote()
+g:remote_fail = {'/workspace/.editorconfig': 'connection closed'}
+RemoteBuffer('/workspace/src/lib/broken.py')
+setlocal shiftwidth=7 noexpandtab
+FireBufferRead(bufnr())
+assert_equal(7, &l:shiftwidth, 'a failed walk must leave the buffer alone')
+assert_false(&l:expandtab)
+assert_equal([], get(b:, 'simpleeditorconfig_sources', []))
+g:remote_fail = {}
+# ... and a read that cannot even be issued (no workspace ready) does the same.
+g:remote_refuse = true
+RemoteBuffer('/workspace/src/lib/refused.py')
+setlocal shiftwidth=7 noexpandtab
+FireBufferRead(bufnr())
+assert_equal(7, &l:shiftwidth)
+assert_equal([], get(b:, 'simpleeditorconfig_sources', []))
+g:remote_refuse = false
+# A failure did not poison the cache: the next buffer walks and applies.
+RemoteBuffer('/workspace/src/lib/after.py')
+FireBufferRead(bufnr())
+assert_equal(3, &l:shiftwidth)
+assert_equal([
+  '/workspace/.editorconfig', '/workspace/src/.editorconfig',
+], b:simpleeditorconfig_sources)
+
+# Asynchronous answers: the options land once every directory has replied,
+# and a re-read that starts while a walk is in flight supersedes it — the
+# earlier answers must not overwrite the later ones.
+simpleeditorconfig#ForgetRemote()
+g:remote_async = true
+var abuf = RemoteBuffer('/workspace/src/lib/async.py')
+setlocal shiftwidth=7
+FireBufferRead(abuf)
+assert_equal(7, &l:shiftwidth, 'nothing applies before the answers arrive')
+assert_true(WaitFor(() => getbufvar(abuf, '&shiftwidth') == 3))
+assert_equal([
+  '/workspace/.editorconfig', '/workspace/src/.editorconfig',
+], b:simpleeditorconfig_sources)
+simpleeditorconfig#ForgetRemote()
+var sbuf = RemoteBuffer('/workspace/src/lib/super.py')
+setlocal shiftwidth=7
+FireBufferRead(sbuf)
+# The first walk captured indent_size = 3; the second, started before any
+# answer arrived, sees indent_size = 4 and must be the one that wins.
+g:remote_editorconfigs['/workspace/src/.editorconfig'] = join([
+  '[*.py]', 'indent_style = space', 'indent_size = 4',
+], "\n")
+FireBufferRead(sbuf)
+assert_true(WaitFor(() => getbufvar(sbuf, '&shiftwidth') != 7))
+sleep 50m
+assert_equal(4, getbufvar(sbuf, '&shiftwidth'),
+  'a superseded walk must not apply its answers')
+g:remote_async = false
+g:remote_editorconfigs['/workspace/src/.editorconfig'] = join([
+  '[*.py]', 'indent_style = space', 'indent_size = 3',
+], "\n")
+
+# Info and Health name the workspace.
+var info = execute('call simpleeditorconfig#Info()')
+assert_match('workspace: ssh:devbox:workspace@12ms mode=virtual buffer=remote', info)
+var health = execute('call simpleeditorconfig#Health()')
+assert_match('remote reads: available', health)
+assert_match('workspace: ssh:devbox:workspace@12ms mode=virtual', health)
+assert_match('remote cache: \d\+ file(s)', health)
+
+# ---------------------------------------------------------------------------
+# Projected modes (sshfs, docker-bind): the workspace is a mount of the remote
+# root, so the walk stops there — what sits above the mount point on this
+# machine is not part of the project.
+const MOUNT = tempname()
+mkdir(MOUNT .. '/proj/src', 'p')
+writefile([
+  'root = true', '[*]', 'indent_style = space', 'indent_size = 9',
+  'max_line_length = 120',
+], MOUNT .. '/.editorconfig')
+writefile([
+  '[*]', 'indent_style = space', 'indent_size = 4',
+], MOUNT .. '/proj/.editorconfig')
+writefile(['x = 1'], MOUNT .. '/proj/src/a.py')
+writefile(['y = 1'], MOUNT .. '/other.py')
+const RESOLVED = resolve(MOUNT)
+g:simpleremote_workspace = {id: 2, kind: 'ssh', target: 'devbox',
+  root: '/srv/app', tree_root: '/srv/app', local_root: MOUNT .. '/proj/',
+  mode: 'sshfs'}
+execute 'edit ' .. fnameescape(MOUNT .. '/proj/src/a.py')
+simpleeditorconfig#Apply(bufnr())
+assert_equal([RESOLVED .. '/proj/.editorconfig'], b:simpleeditorconfig_sources,
+  'a projected buffer must not read above the mount point')
+assert_equal(4, &l:shiftwidth)
+assert_equal(0, &l:textwidth)
+info = execute('call simpleeditorconfig#Info()')
+assert_match('mode=sshfs buffer=projected', info)
+# A local file outside the projection walks as it always did.
+execute 'edit ' .. fnameescape(MOUNT .. '/other.py')
+simpleeditorconfig#Apply(bufnr())
+assert_equal([RESOLVED .. '/.editorconfig'], b:simpleeditorconfig_sources)
+assert_equal(9, &l:shiftwidth)
+info = execute('call simpleeditorconfig#Info()')
+assert_match('mode=sshfs buffer=local', info)
+# local-map is a directory the user chose here; it inherits its surroundings.
+g:simpleremote_workspace.mode = 'local-map'
+execute 'edit ' .. fnameescape(MOUNT .. '/proj/src/a.py')
+simpleeditorconfig#Apply(bufnr())
+assert_equal([RESOLVED .. '/.editorconfig', RESOLVED .. '/proj/.editorconfig'],
+  b:simpleeditorconfig_sources)
+assert_equal(120, &l:textwidth)
+# docker-bind stops at the bind mount like sshfs does.
+g:simpleremote_workspace.mode = 'docker-bind'
+simpleeditorconfig#Apply(bufnr())
+assert_equal([RESOLVED .. '/proj/.editorconfig'], b:simpleeditorconfig_sources)
+assert_equal(0, &l:textwidth)
+# Without a workspace the same buffer is an ordinary local file again.
+unlet g:simpleremote_workspace
+simpleeditorconfig#Apply(bufnr())
+assert_equal(2, len(b:simpleeditorconfig_sources))
+delete(MOUNT, 'rf')
 
 # `unset` takes back a value an earlier section gave, and a .editorconfig is
 # entitled to unset a key that nothing above it ever set.  Removing an absent

@@ -1,8 +1,14 @@
 *simpleeditorconfig.txt*  Local and remote EditorConfig for Vim9
 
 :SimpleEditorConfigReload   Re-read configuration for the current buffer.
-:SimpleEditorConfigInfo     Show sources and effective properties.
-:SimpleEditorConfigHealth   Show integration health.
+                            Cached remote .editorconfig answers are dropped
+                            first, so a file edited outside Vim is seen.
+:SimpleEditorConfigInfo     Show sources, effective properties and, when a
+                            SimpleRemote workspace is connected, the
+                            workspace and how the buffer relates to it
+                            (remote, projected or local).
+:SimpleEditorConfigHealth   Show integration health: remote reads, the
+                            workspace, the size of the remote cache.
 
 Supported properties: indent_style, indent_size, tab_width, end_of_line,
 charset, trim_trailing_whitespace, insert_final_newline and max_line_length.
@@ -11,7 +17,49 @@ Section globs follow the EditorConfig spec: * (which never crosses /), **, ?,
 escapes.  A pattern with no / matches the name at any depth below the
 .editorconfig; one with a / is anchored to the .editorconfig's directory.
 
-SimpleRemote buffers are discovered asynchronously through
-g:SimpleRemoteReadFile().
+OPTIONS                                             *simpleeditorconfig-options*
+
+g:simpleeditorconfig_enable    (default 1)  Apply configuration at all.
+g:simpleeditorconfig_remote    (default 1)  Discover .editorconfig files for
+                                            remote:// buffers.
+g:simpleeditorconfig_verbose   (default 0)  Report what was applied.
+
+SIMPLEREMOTE WORKSPACES                         *simpleeditorconfig-simpleremote*
+
+Everything here is feature-detected; without SimpleRemote the plugin behaves
+like a plain local EditorConfig implementation.
+
+Virtual mode~
+remote:// buffers are filled by SimpleRemote through a BufReadCmd, which
+suppresses BufReadPost, so the plugin applies on |User| SimpleRemoteBufferRead
+instead ({type: 'buffer-read', bufnr, ...} in g:simpleremote_event).  The
+.editorconfig files are discovered through g:SimpleRemoteReadFile(): every
+directory from the file's own up to g:simpleremote_workspace.root is asked at
+once, so a file at any depth costs one round-trip rather than one per level,
+and the answers — hits and "not a file" misses alike — are cached per
+workspace.  The walk is cut at the first `root = true` and never leaves the
+workspace root.
+
+The cache is dropped when a remote:// buffer saves a .editorconfig
+(BufWritePost), when SimpleRemoteFilesChanged reports a created, changed or
+deleted .editorconfig or a directory that may hold one, on
+SimpleRemoteWorkspaceChanged and SimpleRemoteDisconnected, and by
+:SimpleEditorConfigReload.
+
+A read that fails for any reason other than "no such file" — connection
+closed, workspace not ready, request timed out — aborts the walk without
+applying anything: a partial set (a child .editorconfig without the root one
+it builds on) would be worse than the buffer's own defaults.
+
+SimpleRemote fires BufWritePre from its remote BufWriteCmd, so
+trim_trailing_whitespace and charset = utf-8-bom apply to remote saves.
+
+Projected modes~
+In sshfs and docker-bind mode the workspace is a mount of the remote root at
+g:simpleremote_workspace.local_root and its files are ordinary local buffers.
+The walk stops at that mount point: ~/.editorconfig, ~/.local/state and
+whatever else sits above it on this machine is not part of the project.
+local-map is a directory the user chose here and keeps walking to / like any
+local file.
 
 vim:tw=78:ts=8:noet:ft=help:norl:
