@@ -1,2 +1,5 @@
 doc/tags
 tests/errors.log
+
+# Written by tests/defcompile.vim when a script fails to compile.
+tests/defcompile-errors.log

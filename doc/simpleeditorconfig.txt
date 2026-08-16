@@ -6,7 +6,10 @@
 
 Supported properties: indent_style, indent_size, tab_width, end_of_line,
 charset, trim_trailing_whitespace, insert_final_newline and max_line_length.
-Section globs support *, **, ?, character classes and comma braces.
+Section globs follow the EditorConfig spec: * (which never crosses /), **, ?,
+[seq] and [!seq] classes, {a,b} alternation, {n..m} integer ranges and \
+escapes.  A pattern with no / matches the name at any depth below the
+.editorconfig; one with a / is anchored to the .editorconfig's directory.
 
 SimpleRemote buffers are discovered asynchronously through
 g:SimpleRemoteReadFile().

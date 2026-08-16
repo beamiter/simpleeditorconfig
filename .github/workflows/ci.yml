@@ -1,0 +1,44 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: simpleeditorconfig-ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  vim:
+    name: Vim 9.1
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      # vim-nox rather than the minimal build: the suite compiles every :def
+      # ahead of time and drives real popups and terminals, none of which the
+      # tiny build has.
+      - name: Install Vim
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes vim-nox
+          vim --version
+
+      # One target, not a hand-picked list of steps. `make check` is the gate a
+      # developer runs before pushing, so it is the gate CI runs; a list here
+      # would drift from the Makefile and go quietly green.
+      - name: Run the quality gate
+        run: make check
+
+      - name: Validate help tags
+        run: >-
+          vim -Nu NONE -n -i NONE -es
+          -c 'set nomore'
+          -c 'helptags doc'
+          -c 'qa!'

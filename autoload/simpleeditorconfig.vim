@@ -41,36 +41,298 @@ def Parse(lines: list<string>): dict<any>
   return result
 enddef
 
-def ExpandBraces(pattern: string): list<string>
-  var opening = match(pattern, '{[^{}]*}')
-  if opening < 0
-    return [pattern]
+# An EditorConfig section glob is not a Vim glob, and glob2regpat() is not a
+# stand-in for one.  It compiles `*` to `.*`, so `[lib/*.c]` claimed
+# lib/deep/nested/x.c when the spec says `*` never crosses a separator; it hands
+# `[!abc]` straight through as a Vim collection, which matches `!`, `a`, `b` and
+# `c` — the exact inverse of the negation that was asked for; it turns
+# `{1..9}` into a group matching the literal text `1..9`, so a numeric range
+# matched nothing at all; it treats `a{b}c.txt` as a group even though a brace
+# group with no comma in it is the literal file name; and it drops the leading
+# `^` for any pattern starting with `*`, leaving the result unanchored.
+#
+# The brace cross-product that used to run first was worse than wrong, it was
+# slow in a way a colleague could weaponise by accident: it enumerated every
+# combination, so one section with N `{a,b}` groups cost 2^N candidate patterns.
+# Measured on this code, N=14 took 59 ms per buffer opened, N=16 240 ms, N=18
+# 1.0 s — on the BufReadPost path, for every file in the project.
+#
+# So a section glob is compiled here, once, into a single anchored Vim regex,
+# with alternation where the old code had enumeration: N brace groups cost N
+# alternations rather than 2^N patterns.
+
+# The characters that are magic in a Vim pattern under the default 'magic'.
+# `{` is deliberately absent: the quantifier is spelled `\{n,m\}`, so a bare
+# brace is already the literal we want for a comma-less group.
+const MAGIC = '\.*[]~^$'
+
+# Compiled section globs keyed by the raw pattern, holding the regex and the
+# bounds of every {n..m} range in it.  Compiling is a pure function of the
+# pattern and a project reuses the same handful of patterns for every buffer it
+# opens, so this only ever grows by the number of distinct patterns a session
+# has seen.
+var s_globs: dict<dict<any>> = {}
+
+# `[abc]`, `[!abc]` and `[a-z]` map onto a Vim collection almost directly, but
+# EditorConfig spells negation `!` where Vim spells it `^`, and a `]` is an
+# ordinary member when it comes first.  A `[` with no closing `]` is not a
+# collection at all — it is a literal bracket, and emitting an unterminated Vim
+# collection instead would throw a regex error in the middle of a BufReadPost.
+# Returns the regex fragment and the index just past the collection.
+def CompileClass(chars: list<string>, start: number): list<any>
+  var last = len(chars)
+  var i = start + 1
+  var negated = i < last && (chars[i] ==# '!' || chars[i] ==# '^')
+  if negated
+    i += 1
   endif
-  var closing = matchend(pattern, '{[^{}]*}', opening)
-  var body = strpart(pattern, opening + 1, closing - opening - 2)
-  var choices = split(body, ',', 1)
-  if len(choices) <= 1
-    return [pattern]
+  var members = ''
+  if i < last && chars[i] ==# ']'
+    members ..= '\]'
+    i += 1
   endif
-  var expanded: list<string> = []
-  for choice in choices
-    extend(expanded, ExpandBraces(
-      strpart(pattern, 0, opening) .. choice .. strpart(pattern, closing)))
-  endfor
-  return expanded
+  while i < last && chars[i] !=# ']'
+    if chars[i] ==# '\' && i + 1 < last
+      # An escaped member is literal, including the `-` that would otherwise
+      # open a range and the `]` that would otherwise close the collection.
+      members ..= escape(chars[i + 1], '\]^-')
+      i += 2
+      continue
+    endif
+    members ..= chars[i] ==# '\' ? '\\' : chars[i]
+    i += 1
+  endwhile
+  if i >= last
+    return ['\[', start + 1]
+  endif
+  return ['[' .. (negated ? '^' : '') .. members .. ']', i + 1]
+enddef
+
+# The index of the `}` closing the group that opens at `start`, or -1 when the
+# pattern never closes it.
+def CloseBrace(chars: list<string>, start: number): number
+  var last = len(chars)
+  var depth = 0
+  var i = start
+  while i < last
+    if chars[i] ==# '\'
+      i += 2
+      continue
+    endif
+    if chars[i] ==# '{'
+      depth += 1
+    elseif chars[i] ==# '}'
+      depth -= 1
+      if depth == 0
+        return i
+      endif
+    endif
+    i += 1
+  endwhile
+  return -1
+enddef
+
+# Split a group body on its top-level commas.  A single choice coming back means
+# the body held no comma at this level, which is how `a{b}c.txt` is told apart
+# from `a{b,c}.txt`: the first names a file, the second offers a choice.
+def SplitChoices(body: list<string>): list<list<string>>
+  var choices: list<list<string>> = []
+  var current: list<string> = []
+  var depth = 0
+  var i = 0
+  while i < len(body)
+    var char = body[i]
+    if char ==# '\' && i + 1 < len(body)
+      extend(current, [char, body[i + 1]])
+      i += 2
+      continue
+    endif
+    if char ==# '{'
+      depth += 1
+    elseif char ==# '}'
+      depth -= 1
+    endif
+    if char ==# ',' && depth == 0
+      add(choices, current)
+      current = []
+    else
+      add(current, char)
+    endif
+    i += 1
+  endwhile
+  add(choices, current)
+  return choices
+enddef
+
+# Compile one glob into a Vim regex fragment, appending the bounds of every
+# {n..m} it contains to `ranges` in the left-to-right order of the capture
+# groups it emits for them.  Works on a list of characters rather than the
+# string so that a multibyte pattern indexes the same way an ASCII one does.
+def CompileGlob(chars: list<string>, ranges: list<list<number>>): string
+  var out = ''
+  var last = len(chars)
+  var i = 0
+  while i < last
+    var char = chars[i]
+    if char ==# '\'
+      # A backslash escapes whatever follows it.  (The upstream Python
+      # implementation honours this only before a comma or a brace, so it reads
+      # `\*.c` as `*.c`; the spec, the Rust implementations and anyone who names
+      # a file `*.c` all disagree with it.)
+      out ..= i + 1 < last ? escape(chars[i + 1], MAGIC) : '\\'
+      i += 2
+    elseif char ==# '*'
+      if i + 1 < last && chars[i + 1] ==# '*'
+        out ..= '.*'
+        i += 2
+      else
+        out ..= '[^/]*'
+        i += 1
+      endif
+    elseif char ==# '?'
+      out ..= '[^/]'
+      i += 1
+    elseif char ==# '/'
+      # `/**/` stands for a single separator as well as for any run of
+      # directories, which is what makes `lib/**/*.c` cover lib/x.c and not only
+      # lib/deep/x.c.
+      if i + 3 < last && chars[i + 1] ==# '*' && chars[i + 2] ==# '*'
+          && chars[i + 3] ==# '/'
+        out ..= '/\%(.*/\)\?'
+        i += 4
+      else
+        out ..= '/'
+        i += 1
+      endif
+    elseif char ==# '['
+      var collection = CompileClass(chars, i)
+      out ..= collection[0]
+      i = collection[1]
+    elseif char ==# '{'
+      var close = CloseBrace(chars, i)
+      if close < 0
+        out ..= '{'
+        i += 1
+        continue
+      endif
+      var body = slice(chars, i + 1, close)
+      var bounds = matchlist(join(body, ''),
+        '^\([-+]\?\d\+\)\.\.\([-+]\?\d\+\)$')
+      if !empty(bounds)
+        # A range cannot become an alternation of the integers in it —
+        # `{1..9999}` would be 9999 branches — so the regex captures the digits
+        # and SectionMatches() compares them numerically.  Vim only has nine
+        # capture groups, so a tenth range in one pattern matches any integer
+        # unchecked; that is a wider match than the spec asks for, and it beats
+        # raising E872 from inside a BufReadPost.
+        if len(ranges) < 9
+          out ..= '\([-+]\?\d\+\)'
+          add(ranges, [str2nr(bounds[1]), str2nr(bounds[2])])
+        else
+          out ..= '\%([-+]\?\d\+\)'
+        endif
+      else
+        var choices = SplitChoices(body)
+        if len(choices) == 1
+          out ..= '{' .. CompileGlob(choices[0], ranges) .. '}'
+        else
+          var alternatives: list<string> = []
+          for choice in choices
+            add(alternatives, CompileGlob(choice, ranges))
+          endfor
+          out ..= '\%(' .. join(alternatives, '\|') .. '\)'
+        endif
+      endif
+      i = close + 1
+    else
+      out ..= escape(char, MAGIC)
+      i += 1
+    endif
+  endwhile
+  return out
+enddef
+
+def SectionGlob(pattern: string): dict<any>
+  if has_key(s_globs, pattern)
+    return s_globs[pattern]
+  endif
+  var glob = pattern
+  # A pattern with no separator in it matches the name at any depth below the
+  # .editorconfig; one with a separator is anchored to the .editorconfig's own
+  # directory, and a leading `/` only says so more loudly.  The test is made
+  # before the leading `/` is stripped, so `[/top.c]` stays anchored.
+  var anchored = stridx(glob, '/') >= 0
+  var prefix = '\%(.*/\)\?'
+  if anchored
+    glob = substitute(glob, '^/', '', '')
+    # A leading `**/` also stands for no directory at all: `[**/foo/*.c]` covers
+    # foo/z.c as well as q/foo/z.c.
+    prefix = ''
+    if strpart(glob, 0, 3) ==# '**/'
+      prefix = '\%(.*/\)\?'
+      glob = strpart(glob, 3)
+    endif
+  endif
+  var ranges: list<list<number>> = []
+  var compiled: dict<any> = {regex: '', ranges: ranges, usable: true}
+  # Both halves of this are fallible and they fail for the same reason, so they
+  # share one guard.  Not every collection a user can type is a collection Vim
+  # will run: `[z-a]` is E944, and Vim only finds that out when the regex is
+  # first used.  And not every pattern can be compiled at all: CompileGlob()
+  # recurses once per level of brace nesting, so a section with about a hundred
+  # nested `{a,` groups is E132 before any regex exists.  Either one, left
+  # alone, is thrown inside a BufReadPost for every file opened in the project,
+  # forever.  Take them here instead, once, and let the unusable section match
+  # nothing rather than take the rest of the .editorconfig down with it.
+  #
+  # `\m\C` pins the regex to magic and case-sensitive matching whatever the user
+  # has set 'magic' and 'ignorecase' to: matchlist() below honours 'ignorecase',
+  # and a file name is not a search.
+  try
+    compiled.regex = '\m\C^' .. prefix
+      .. CompileGlob(split(glob, '\zs'), ranges) .. '$'
+    var probe = 'x' =~# compiled.regex
+  catch
+    Warn(printf('ignoring section [%s]: %s', pattern,
+      substitute(v:exception, '^Vim(\a*):', '', '')))
+    compiled.usable = false
+  endtry
+  s_globs[pattern] = compiled
+  return compiled
 enddef
 
 def SectionMatches(pattern: string, config_dir: string, path: string): bool
   var relative = path ==# config_dir ? fnamemodify(path, ':t')
     : substitute(strpart(path, strlen(config_dir)), '^/', '', '')
-  for candidate in ExpandBraces(pattern)
-    var normalized = substitute(candidate, '^/', '', '')
-    var subject = normalized =~# '/' ? relative : fnamemodify(path, ':t')
-    if subject =~# glob2regpat(normalized)
-      return true
+  var compiled = SectionGlob(pattern)
+  if !compiled.usable
+    return false
+  endif
+  if empty(compiled.ranges)
+    return relative =~# compiled.regex
+  endif
+  var matched = matchlist(relative, compiled.regex)
+  if empty(matched)
+    return false
+  endif
+  var group = 1
+  for bounds in compiled.ranges
+    var digits = matched[group]
+    group += 1
+    if empty(digits)
+      # This range sat in a brace alternative that was not the one taken.
+      continue
+    endif
+    if digits =~# '^[-+]\?0\d'
+      # A name spelled 007 is not the integer 7 for the purpose of `{1..100}`.
+      return false
+    endif
+    var value = str2nr(digits)
+    if value < bounds[0] || value > bounds[1]
+      return false
     endif
   endfor
-  return false
+  return true
 enddef
 
 def Effective(configs: list<dict<any>>, path: string): dict<string>
@@ -82,7 +344,15 @@ def Effective(configs: list<dict<any>>, path: string): dict<string>
       endif
       for [key, value] in items(section.properties)
         if value ==# 'unset'
-          remove(properties, key)
+          # `unset` takes back a value an earlier section gave, and a section is
+          # perfectly entitled to unset something nothing ever set — a child
+          # .editorconfig that clears a key its parent happens not to define.
+          # remove() on an absent key is E716, thrown out of Apply() on the
+          # BufReadPost path, which loses every other property of the file as
+          # well as the one being unset.
+          if has_key(properties, key)
+            remove(properties, key)
+          endif
         else
           properties[key] = value
         endif
@@ -189,13 +459,42 @@ def ApplyProperties(buf: number, properties: dict<string>, sources: list<string>
   endif
 enddef
 
+# Parsed .editorconfig files keyed by their full path.  Every file opened in a
+# project re-walks the same directories and re-reads the same .editorconfig that
+# the file before it read; with matching down to one compiled regex, reading and
+# parsing is what is left on the BufReadPost path.
+#
+# A stale .editorconfig is worse than reading one again, so an entry is reused
+# only when the file's mtime and size are still exactly what they were when it
+# was read — and it is not stored at all while that mtime is the current second.
+# getftime() has one-second resolution, so a write landing in the same second as
+# our read would otherwise be invisible for as long as the session lives, which
+# is exactly the sequence "edit .editorconfig, save, open a file to see what it
+# did".  Once the second has passed, any later write must produce a different
+# mtime, and the entry falls out on its own.
+var s_parsed: dict<dict<any>> = {}
+
+def ParseFile(file: string): dict<any>
+  var ftime = getftime(file)
+  var size = getfsize(file)
+  var cached = get(s_parsed, file, {})
+  if !empty(cached) && cached.ftime == ftime && cached.size == size
+    return cached.parsed
+  endif
+  var parsed = Parse(readfile(file))
+  if ftime != localtime()
+    s_parsed[file] = {ftime: ftime, size: size, parsed: parsed}
+  endif
+  return parsed
+enddef
+
 def LocalConfigs(path: string): list<dict<any>>
   var configs: list<dict<any>> = []
   var dir = fnamemodify(path, ':h')
   while !empty(dir)
     var file = dir .. '/.editorconfig'
     if filereadable(file)
-      var parsed = Parse(readfile(file))
+      var parsed = ParseFile(file)
       add(configs, {dir: dir, path: file, parsed: parsed})
       if parsed.root
         break

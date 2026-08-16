@@ -80,6 +80,32 @@ simpleeditorconfig#Apply(bufnr())
 assert_equal(reads_before, len(g:remote_editorconfig_reads))
 assert_equal(6, &l:shiftwidth)
 
+# `unset` takes back a value an earlier section gave, and a .editorconfig is
+# entitled to unset a key that nothing above it ever set.  Removing an absent
+# key is E716, which used to be thrown out of Apply() on the BufReadPost path
+# and cost the buffer every other property in the file, not only the unset one.
+mkdir(BASE .. '/unset', 'p')
+writefile([
+  'root = true',
+  '[*]',
+  'indent_style = space',
+  'indent_size = 4',
+  '',
+  '[*.md]',
+  'indent_size = unset',
+  'max_line_length = unset',
+  'tab_width = 2',
+], BASE .. '/unset/.editorconfig')
+writefile(['# heading'], BASE .. '/unset/notes.md')
+execute 'edit ' .. fnameescape(BASE .. '/unset/notes.md')
+simpleeditorconfig#Apply(bufnr())
+assert_false(has_key(b:simpleeditorconfig, 'indent_size'),
+  'an unset key must be removed')
+assert_false(has_key(b:simpleeditorconfig, 'max_line_length'),
+  'unsetting a key nothing ever set must not abort the rest of the section')
+assert_equal('2', b:simpleeditorconfig.tab_width)
+assert_equal('space', b:simpleeditorconfig.indent_style)
+
 assert_equal(2, exists(':SimpleEditorConfigReload'))
 delete(BASE, 'rf')
 if !empty(v:errors)
