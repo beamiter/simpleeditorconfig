@@ -246,8 +246,40 @@ g:remote_editorconfigs['/workspace/src/.editorconfig'] = join([
   '[*.py]', 'indent_style = space', 'indent_size = 3',
 ], "\n")
 
-# A transport failure is not "no .editorconfig": a walk that did not see the
-# whole picture applies nothing rather than a partial, incoherent set.
+# A transport failure above the first `root = true` is a failure to read a
+# file the walk was going to throw away: the part that decides this buffer is
+# complete, so it applies.  The old sequential walk stopped at the root marker
+# and never asked that directory at all.
+simpleeditorconfig#ForgetRemote()
+g:remote_editorconfigs['/workspace/src/.editorconfig'] = join([
+  'root = true', '[*.py]', 'indent_style = space', 'indent_size = 5',
+], "\n")
+g:remote_fail = {'/workspace/.editorconfig': 'connection closed'}
+RemoteBuffer('/workspace/src/lib/rooted_broken.py')
+setlocal shiftwidth=7 noexpandtab
+FireBufferRead(bufnr())
+assert_equal(['/workspace/src/.editorconfig'],
+  get(b:, 'simpleeditorconfig_sources', []),
+  'a failure above the root cut must not discard the walk')
+assert_equal(5, &l:shiftwidth)
+assert_true(&l:expandtab)
+# What answered is cached and what failed is not, so the next buffer in the
+# same directory asks for the failed directory alone.
+g:remote_fail = {}
+reads_before = len(g:remote_editorconfig_reads)
+RemoteBuffer('/workspace/src/lib/reasked.py')
+FireBufferRead(bufnr())
+assert_equal(['/workspace/.editorconfig'],
+  g:remote_editorconfig_reads[reads_before :],
+  'a failed read must not be cached, and an answered one must not be re-read')
+assert_equal(5, &l:shiftwidth)
+g:remote_editorconfigs['/workspace/src/.editorconfig'] = join([
+  '[*.py]', 'indent_style = space', 'indent_size = 3',
+], "\n")
+
+# A transport failure inside the range the cut keeps is not "no
+# .editorconfig": a walk that did not see the whole picture applies nothing
+# rather than a partial, incoherent set.
 simpleeditorconfig#ForgetRemote()
 g:remote_fail = {'/workspace/.editorconfig': 'connection closed'}
 RemoteBuffer('/workspace/src/lib/broken.py')
@@ -300,10 +332,61 @@ assert_true(WaitFor(() => getbufvar(sbuf, '&shiftwidth') != 7))
 sleep 50m
 assert_equal(4, getbufvar(sbuf, '&shiftwidth'),
   'a superseded walk must not apply its answers')
-g:remote_async = false
+
+# An invalidation that lands while a walk is on the wire must not be undone by
+# that walk's late answers: they carry what the file said before the change,
+# they may still configure the buffer that asked for them, and they must never
+# reach the cache, where every buffer opened afterwards would read them.
 g:remote_editorconfigs['/workspace/src/.editorconfig'] = join([
   '[*.py]', 'indent_style = space', 'indent_size = 3',
 ], "\n")
+simpleeditorconfig#ForgetRemote()
+reads_before = len(g:remote_editorconfig_reads)
+var rbuf = RemoteBuffer('/workspace/src/lib/race.py')
+setlocal shiftwidth=7
+FireBufferRead(rbuf)
+assert_equal(3, len(g:remote_editorconfig_reads) - reads_before,
+  'the reads must be on the wire when the change lands')
+# They are; the file changes remotely now, before any of them answers.
+g:remote_editorconfigs['/workspace/src/.editorconfig'] = join([
+  '[*.py]', 'indent_style = space', 'indent_size = 6',
+], "\n")
+Fire('SimpleRemoteFilesChanged', {changes: [
+  {path: '/workspace/src/.editorconfig', type: 'changed'}],
+  workspace: copy(g:simpleremote_workspace)})
+assert_true(WaitFor(() => getbufvar(rbuf, '&shiftwidth') != 7))
+assert_equal(3, getbufvar(rbuf, '&shiftwidth'),
+  'the buffer applies the answers it asked for')
+sleep 20m
+g:remote_async = false
+reads_before = len(g:remote_editorconfig_reads)
+RemoteBuffer('/workspace/src/lib/after_race.py')
+FireBufferRead(bufnr())
+assert_equal(3, len(g:remote_editorconfig_reads) - reads_before,
+  'answers that raced an invalidation must not be cached')
+assert_equal(6, &l:shiftwidth, 'the next buffer must see the new file')
+g:remote_editorconfigs['/workspace/src/.editorconfig'] = join([
+  '[*.py]', 'indent_style = space', 'indent_size = 3',
+], "\n")
+simpleeditorconfig#ForgetRemote()
+
+# The same holds for the events that empty the whole cache — a workspace
+# swapped for another, a disconnect, :SimpleEditorConfigReload: a walk that
+# was in flight must not re-fill what they threw away.
+g:remote_async = true
+reads_before = len(g:remote_editorconfig_reads)
+var wbuf = RemoteBuffer('/workspace/src/lib/swapped.py')
+setlocal shiftwidth=7
+FireBufferRead(wbuf)
+assert_equal(3, len(g:remote_editorconfig_reads) - reads_before,
+  'the reads must be on the wire when the workspace changes')
+Fire('SimpleRemoteWorkspaceChanged', {snapshot: copy(g:simpleremote_workspace)})
+assert_true(WaitFor(() => getbufvar(wbuf, '&shiftwidth') == 3))
+sleep 20m
+assert_match('remote cache: 0 file(s)',
+  execute('call simpleeditorconfig#Health()'),
+  'answers from before the invalidation must stay out of the cache')
+g:remote_async = false
 
 # Info and Health name the workspace.
 var info = execute('call simpleeditorconfig#Info()')
@@ -314,9 +397,9 @@ assert_match('workspace: ssh:devbox:workspace@12ms mode=virtual', health)
 assert_match('remote cache: \d\+ file(s)', health)
 
 # ---------------------------------------------------------------------------
-# Projected modes (sshfs, docker-bind): the workspace is a mount of the remote
-# root, so the walk stops there — what sits above the mount point on this
-# machine is not part of the project.
+# An sshfs workspace is a mount SimpleRemote made of the remote root under
+# ~/.local/state/vim/simpleremote/mounts, so the walk stops there: what sits
+# above the mount point on this machine is not part of the project.
 const MOUNT = tempname()
 mkdir(MOUNT .. '/proj/src', 'p')
 writefile([
@@ -354,11 +437,19 @@ simpleeditorconfig#Apply(bufnr())
 assert_equal([RESOLVED .. '/.editorconfig', RESOLVED .. '/proj/.editorconfig'],
   b:simpleeditorconfig_sources)
 assert_equal(120, &l:textwidth)
-# docker-bind stops at the bind mount like sshfs does.
+# docker-bind is the host side of a bind mount — g:simpleremote_local_roots or
+# the Source of the container's mount, either way a checkout the user keeps in
+# their own tree.  Connecting a container must not change what an ordinary
+# local buffer in it gets, so it inherits its surroundings like local-map.
 g:simpleremote_workspace.mode = 'docker-bind'
 simpleeditorconfig#Apply(bufnr())
-assert_equal([RESOLVED .. '/proj/.editorconfig'], b:simpleeditorconfig_sources)
-assert_equal(0, &l:textwidth)
+assert_equal([RESOLVED .. '/.editorconfig', RESOLVED .. '/proj/.editorconfig'],
+  b:simpleeditorconfig_sources,
+  'a docker-bind checkout must keep inheriting from above the bind point')
+assert_equal(120, &l:textwidth)
+# It is still a projection, and Info() says so.
+info = execute('call simpleeditorconfig#Info()')
+assert_match('mode=docker-bind buffer=projected', info)
 # Without a workspace the same buffer is an ordinary local file again.
 unlet g:simpleremote_workspace
 simpleeditorconfig#Apply(bufnr())

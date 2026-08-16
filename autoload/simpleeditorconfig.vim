@@ -495,10 +495,10 @@ def ParseFile(file: string): dict<any>
 enddef
 
 # Walk from the file's directory towards the filesystem root, or towards
-# `stop` when one is given: a projected SimpleRemote workspace (sshfs,
-# docker-bind) is a mount of the remote root, and what sits above the mount
-# point — ~/.local/state, ~/.editorconfig — belongs to this machine, not to
-# the project.  Reading it would give a remote file properties its own
+# `stop` when one is given: an sshfs workspace is a mount SimpleRemote made of
+# the remote root, and what sits above the mount point —
+# ~/.local/state/vim/simpleremote, ~/.editorconfig — belongs to this machine,
+# not to the project.  Reading it would give a remote file properties its own
 # repository never asked for.
 def LocalConfigs(path: string, stop: string = ''): list<dict<any>>
   var configs: list<dict<any>> = []
@@ -524,28 +524,53 @@ def LocalConfigs(path: string, stop: string = ''): list<dict<any>>
   return reverse(configs)
 enddef
 
-# The local root of a projected workspace when `path` sits under it, or ''.
-# local-map is left out on purpose: that mode maps the workspace onto a
-# directory the user chose on this machine — a checkout of the same project,
-# typically — and a checkout inherits its surroundings like any local file.
-def ProjectionRoot(path: string): string
-  var workspace = get(g:, 'simpleremote_workspace', {})
-  if type(workspace) != v:t_dict || get(workspace, 'mode', '') ==# 'local-map'
-    return ''
+# `path` is `root` itself or sits below it.  Plain string containment would
+# call /workspace2/x a child of /workspace, which it is not.
+def UnderRoot(path: string, root: string): bool
+  if empty(root)
+    return false
   endif
+  var prefix = root ==# '/' ? '/' : root .. '/'
+  return path ==# root || stridx(path, prefix) == 0
+enddef
+
+# The workspace's local projection, normalized, whatever the mode, or ''.
+def LocalRoot(workspace: dict<any>): string
   var local_root = get(workspace, 'local_root', '')
   if type(local_root) != v:t_string || empty(local_root)
     return ''
   endif
   local_root = substitute(resolve(fnamemodify(local_root, ':p')), '/\+$', '', '')
-  if empty(local_root)
-    local_root = '/'
-  endif
-  var prefix = local_root ==# '/' ? '/' : local_root .. '/'
-  if path !=# local_root && stridx(path, prefix) != 0
+  return empty(local_root) ? '/' : local_root
+enddef
+
+# The directory the walk must stop at for `path`, or ''.
+#
+# Only an sshfs mount qualifies.  It is a directory SimpleRemote itself made
+# under ~/.local/state/vim/simpleremote/mounts to hang the remote root off,
+# and the .editorconfig files above it are this machine's, addressed to
+# nothing in particular.  ('mounting' is that mount being made and carries no
+# local_root at all.)
+#
+# The other two projections are not that: local-map is a directory the user
+# pointed the workspace at, and docker-bind resolves to the host side of a
+# bind mount — either the user's own g:simpleremote_local_roots entry or the
+# Source of the container's mount, which is a checkout sitting in the user's
+# own tree.  Both are places the user chose on this machine, and a checkout
+# inherits its surroundings like any local file; cutting the walk there would
+# change what an ordinary local buffer gets the moment a workspace happens to
+# be connected.
+def ProjectionRoot(path: string): string
+  var workspace = get(g:, 'simpleremote_workspace', {})
+  if type(workspace) != v:t_dict
     return ''
   endif
-  return local_root
+  var mode = get(workspace, 'mode', '')
+  if type(mode) != v:t_string || mode !=# 'sshfs'
+    return ''
+  endif
+  var local_root = LocalRoot(workspace)
+  return UnderRoot(path, local_root) ? local_root : ''
 enddef
 
 # Remote .editorconfig files, parsed, keyed by workspace id and remote path.
@@ -566,6 +591,21 @@ enddef
 # from ever seeing the previous connection's answers.
 var s_remote_parsed: dict<dict<any>> = {}
 
+# Emptying the cache is not enough on its own, because a walk that is on the
+# wire when it happens answers afterwards with what the file said *before* the
+# change, and publishing that re-fills the cache with exactly the copy the
+# invalidation threw away — for the rest of the session, since nothing asks
+# again.  That is not a theoretical ordering either: a SimpleRemoteFilesChanged
+# from an upload's own scp job, or a SimpleRemoteWorkspaceChanged from
+# :SimpleRemoteTreeSetRoot, is emitted from somewhere other than the agent
+# channel the reads travel on, and lands between them.
+#
+# So every invalidation bumps this counter, a walk remembers the value it was
+# started under, and an answer from an older one still configures its own
+# buffer — that is what the buffer asked for — but is never published to the
+# cache, where it would configure buffers opened after the change.
+var s_remote_epoch = 0
+
 def RemoteKey(workspace: dict<any>, file: string): string
   return string(get(workspace, 'id', '')) .. ':' .. file
 enddef
@@ -577,21 +617,29 @@ enddef
 # Drop every cached remote .editorconfig.
 export def ForgetRemote()
   s_remote_parsed = {}
+  s_remote_epoch += 1
 enddef
 
 # Drop the cached entries a change to `paths` may have touched: a
 # .editorconfig itself, or a directory that was created, renamed or deleted
 # with .editorconfig files somewhere under it.
+#
+# An empty cache is not a reason to return early: a walk may be in flight with
+# answers that predate this change, and the epoch is what keeps them out of
+# the cache.  It is bumped once for any report carrying a usable path, even
+# one that removed nothing — whether a directory the report names holds an
+# .editorconfig a walk is reading right now is not knowable from here, and the
+# price of assuming it does is that one walk's answers are read again.
 def ForgetRemotePaths(paths: list<string>)
-  if empty(s_remote_parsed)
-    return
-  endif
+  var touched = false
   for path in paths
     if type(path) != v:t_string || empty(path)
       continue
     endif
+    touched = true
     if path =~# '/\.editorconfig$' || path ==# '.editorconfig'
       s_remote_parsed = {}
+      s_remote_epoch += 1
       return
     endif
     var prefix = substitute(path, '/\+$', '', '') .. '/'
@@ -602,6 +650,9 @@ def ForgetRemotePaths(paths: list<string>)
       endif
     endfor
   endfor
+  if touched
+    s_remote_epoch += 1
+  endif
 enddef
 
 # The directories whose .editorconfig may apply to `path`: its own, then each
@@ -610,8 +661,7 @@ enddef
 def RemoteDirs(path: string, root: string): list<string>
   var dirs: list<string> = []
   var dir = fnamemodify(path, ':h')
-  var prefix = root ==# '/' ? '/' : root .. '/'
-  if dir !=# root && stridx(dir, prefix) != 0
+  if !UnderRoot(dir, root)
     return dirs
   endif
   while true
@@ -639,6 +689,15 @@ enddef
 
 # Once every directory has answered, keep the configs from the file's own
 # directory up to the first one that says `root = true` and apply them.
+#
+# A directory that failed to answer only matters inside the range that cut
+# keeps.  The walk asks every directory up to the workspace root at once, so
+# it also asks the ones a `root = true` further down makes irrelevant, and a
+# timeout or an unreadable directory up there says nothing about the part of
+# the picture that decides this file — the sequential walk this replaced never
+# even looked at it.  Below the cut it is the opposite: a child .editorconfig
+# without the root one it builds on is an incoherent set, worse than the
+# buffer's own defaults, so nothing is applied.
 def MaybeFinish(state: dict<any>)
   if state.done || state.answered < len(state.dirs)
     return
@@ -647,6 +706,9 @@ def MaybeFinish(state: dict<any>)
   var configs: list<dict<any>> = []
   for idx in range(len(state.dirs))
     var entry = state.results[idx]
+    if get(entry, 'failed', false)
+      return
+    endif
     if !entry.ok
       continue
     endif
@@ -661,20 +723,24 @@ enddef
 
 # One directory's answer.  The agent's "no such file" reply is `not a file:
 # <path>`; every other failure — connection closed, workspace not ready,
-# request timed out, cannot read — means the walk did not see the whole
-# picture, and applying the part it did see (a child config without the root
-# config it builds on) would replace the buffer's baseline with something
-# incoherent.  Leaving the buffer alone is the better outcome.
+# request timed out, cannot read — is recorded against that one directory and
+# left out of the cache, for MaybeFinish() to weigh against where the walk is
+# cut.
 def OnRead(state: dict<any>, idx: number, ok: bool, body: string)
   if state.done
     return
   endif
+  var entry: dict<any>
   if !ok && body !~# '^not a file:'
-    state.done = true
-    return
+    entry = {ok: false, failed: true, parsed: {}}
+  else
+    entry = {ok: ok, failed: false,
+      parsed: ok ? Parse(split(body, "\n", 1)) : {}}
+    if state.epoch == s_remote_epoch
+      var key = RemoteKey(state.workspace, RemoteFile(state.dirs[idx]))
+      s_remote_parsed[key] = entry
+    endif
   endif
-  var entry = {ok: ok, parsed: ok ? Parse(split(body, "\n", 1)) : {}}
-  s_remote_parsed[RemoteKey(state.workspace, RemoteFile(state.dirs[idx]))] = entry
   state.results[idx] = entry
   state.answered += 1
   MaybeFinish(state)
@@ -695,7 +761,7 @@ def Collect(buf: number, path: string, dirs: list<string>,
     workspace: dict<any>, token: number)
   var state: dict<any> = {buf: buf, path: path, dirs: dirs, token: token,
     workspace: workspace, results: repeat([{}], len(dirs)), answered: 0,
-    done: false}
+    done: false, epoch: s_remote_epoch}
   for idx in range(len(dirs))
     var cached = get(s_remote_parsed, RemoteKey(workspace, RemoteFile(dirs[idx])), {})
     if !empty(cached)
@@ -707,10 +773,15 @@ def Collect(buf: number, path: string, dirs: list<string>,
     if !empty(state.results[idx])
       continue
     endif
-    if !IssueRead(state, idx) || state.done
-      # Refused outright, or an earlier synchronous failure already ended the
-      # walk: nothing is applied.
+    if !IssueRead(state, idx)
+      # Refused outright: the workspace is not ready, so the directories not
+      # asked for yet would be refused too and nothing is applied.
       state.done = true
+      return
+    endif
+    if state.done
+      # Every directory answered on the spot and the walk has already
+      # finished.
       return
     endif
   endfor
@@ -730,8 +801,7 @@ def ApplyRemote(buf: number, path: string)
   if root ==# ''
     root = '/'
   endif
-  var prefix = root ==# '/' ? '/' : root .. '/'
-  if path !=# root && stridx(path, prefix) != 0
+  if !UnderRoot(path, root)
     return
   endif
   s_generation += 1
@@ -831,7 +901,9 @@ def WorkspaceLine(): string
   if type(remote) == v:t_dict && !empty(get(remote, 'path', ''))
     relation = 'remote'
   elseif &buftype ==# '' && !empty(bufname())
-      && !empty(ProjectionRoot(resolve(fnamemodify(bufname(), ':p'))))
+      && UnderRoot(resolve(fnamemodify(bufname(), ':p')), LocalRoot(workspace))
+    # Any projection, not only the ones the walk stops at: this reports where
+    # the buffer is, and Info() lists the sources it got right underneath.
     relation = 'projected'
   endif
   return printf('%s mode=%s buffer=%s', label,
