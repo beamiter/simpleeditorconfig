@@ -333,6 +333,44 @@ sleep 50m
 assert_equal(4, getbufvar(sbuf, '&shiftwidth'),
   'a superseded walk must not apply its answers')
 
+# Supersession is not only remote-vs-remote.  A buffer can be repurposed while
+# reads are in flight (or the integration can be disabled); any later local
+# Apply() must invalidate the remote token before setting its own properties.
+simpleeditorconfig#ForgetRemote()
+var rolebuf = RemoteBuffer('/workspace/src/lib/role_change.py')
+setlocal shiftwidth=7
+FireBufferRead(rolebuf)
+var remote_token = getbufvar(rolebuf, 'simpleeditorconfig_token', -1)
+setlocal buftype=
+unlet b:vimrc_remote
+execute 'silent file ' .. fnameescape(BASE .. '/role_change.py')
+simpleeditorconfig#Apply(rolebuf)
+var local_token = getbufvar(rolebuf, 'simpleeditorconfig_token', -1)
+assert_notequal(remote_token, local_token,
+  'a local Apply() did not supersede the remote request token')
+assert_equal(2, getbufvar(rolebuf, '&shiftwidth'))
+sleep 50m
+assert_equal(2, getbufvar(rolebuf, '&shiftwidth'),
+  'late remote answers overwrote a later local Apply() on the same buffer')
+
+var before_resource = getbufvar(rolebuf, 'simpleeditorconfig_token', -1)
+execute 'source ' .. fnameescape(ROOT .. '/autoload/simpleeditorconfig.vim')
+simpleeditorconfig#Apply(rolebuf)
+assert_true(getbufvar(rolebuf, 'simpleeditorconfig_token', -1) > before_resource,
+  're-sourcing the autoload script reused a live buffer token')
+
+g:simpleeditorconfig_remote = []
+var malformed_flag_buf = RemoteBuffer('/workspace/src/lib/malformed_flag.py')
+setlocal shiftwidth=7
+try
+  FireBufferRead(malformed_flag_buf)
+catch
+  assert_report('a mistyped remote flag threw: ' .. v:exception)
+endtry
+assert_true(WaitFor(() => getbufvar(malformed_flag_buf, '&shiftwidth') == 4),
+  'a mistyped remote flag did not fall back to enabled')
+g:simpleeditorconfig_remote = 1
+
 # An invalidation that lands while a walk is on the wire must not be undone by
 # that walk's late answers: they carry what the file said before the change,
 # they may still configure the buffer that asked for them, and they must never
@@ -481,6 +519,47 @@ assert_false(has_key(b:simpleeditorconfig, 'max_line_length'),
   'unsetting a key nothing ever set must not abort the rest of the section')
 assert_equal('2', b:simpleeditorconfig.tab_width)
 assert_equal('space', b:simpleeditorconfig.indent_style)
+
+# charset is not conditional on whitespace trimming.  The old BeforeWrite()
+# returned before setting 'bomb' whenever trim_trailing_whitespace was absent,
+# and a later reload without charset left its stale buffer flag behind.
+mkdir(BASE .. '/bom', 'p')
+writefile([
+  'root = true', '[*.txt]', 'charset = utf-8-bom',
+], BASE .. '/bom/.editorconfig')
+writefile(['payload  '], BASE .. '/bom/data.txt')
+execute 'edit ' .. fnameescape(BASE .. '/bom/data.txt')
+simpleeditorconfig#Apply(bufnr())
+assert_true(&l:bomb, 'utf-8-bom must apply without trim_trailing_whitespace')
+simpleeditorconfig#BeforeWrite()
+assert_equal('payload  ', getline(1), 'charset must not imply whitespace trimming')
+writefile(['root = true', '[*.txt]', 'charset = utf-8'],
+  BASE .. '/bom/.editorconfig')
+simpleeditorconfig#Reload(bufnr())
+assert_false(&l:bomb, 'utf-8 must remove a BOM requested by the old config')
+assert_false(b:simpleeditorconfig_bomb, 'the compatibility flag must not stay stale')
+writefile(['root = true', '[*.txt]'], BASE .. '/bom/.editorconfig')
+simpleeditorconfig#Reload(bufnr())
+assert_false(&l:bomb, 'removing charset must restore the original buffer baseline')
+
+# Runtime enable/verbose flags accept only booleans/numbers.  A malformed value
+# falls back instead of aborting BufReadPost/Reload halfway through applying a
+# file's otherwise valid properties.
+mkdir(BASE .. '/bad-options', 'p')
+writefile(['root = true', '[*.txt]', 'indent_size = 2'],
+  BASE .. '/bad-options/.editorconfig')
+writefile(['payload'], BASE .. '/bad-options/data.txt')
+execute 'edit! ' .. fnameescape(BASE .. '/bad-options/data.txt')
+g:simpleeditorconfig_enable = []
+g:simpleeditorconfig_verbose = 'loud'
+try
+  simpleeditorconfig#Reload(bufnr())
+catch
+  assert_report('mistyped runtime flags threw: ' .. v:exception)
+endtry
+assert_equal(2, &l:shiftwidth)
+g:simpleeditorconfig_enable = 1
+g:simpleeditorconfig_verbose = 0
 
 assert_equal(2, exists(':SimpleEditorConfigReload'))
 delete(BASE, 'rf')

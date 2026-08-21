@@ -24,6 +24,9 @@ g:simpleeditorconfig_remote    (default 1)  Discover .editorconfig files for
                                             remote:// buffers.
 g:simpleeditorconfig_verbose   (default 0)  Report what was applied.
 
+The three flags accept booleans or numbers.  Invalid types fall back to their
+documented defaults.
+
 SIMPLEREMOTE WORKSPACES                         *simpleeditorconfig-simpleremote*
 
 Everything here is feature-detected; without SimpleRemote the plugin behaves

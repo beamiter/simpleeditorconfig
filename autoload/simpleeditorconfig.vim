@@ -8,6 +8,14 @@ def Warn(message: string)
   echohl None
 enddef
 
+def Flag(name: string, fallback: bool): bool
+  var configured: any = get(g:, name, fallback ? 1 : 0)
+  if type(configured) == v:t_bool
+    return configured
+  endif
+  return type(configured) == v:t_number ? configured != 0 : fallback
+enddef
+
 def Parse(lines: list<string>): dict<any>
   var result: dict<any> = {root: false, sections: []}
   var current: dict<any> = {}
@@ -374,6 +382,7 @@ def BufferBaseline(buf: number): dict<any>
     tabstop: getbufvar(buf, '&tabstop'),
     fileformat: getbufvar(buf, '&fileformat'),
     fileencoding: getbufvar(buf, '&fileencoding'),
+    bomb: getbufvar(buf, '&bomb'),
     textwidth: getbufvar(buf, '&textwidth'),
     fixendofline: getbufvar(buf, '&fixendofline'),
     endofline: getbufvar(buf, '&endofline'),
@@ -434,8 +443,14 @@ def ApplyProperties(buf: number, properties: dict<string>, sources: list<string>
   var charset = get(properties, 'charset', '')
   if has_key(charsets, charset)
     SetOption(buf, 'fileencoding', charsets[charset])
-    setbufvar(buf, 'simpleeditorconfig_bomb', charset ==# 'utf-8-bom')
+    # 'bomb' is independent of trailing-whitespace cleanup.  Keeping it as a
+    # deferred flag in BeforeWrite() meant `charset = utf-8-bom` did nothing
+    # unless the same section also enabled trim_trailing_whitespace.  Set the
+    # buffer option with the rest of the charset now; RestoreBaseline() above
+    # also clears a BOM when a reload removes or changes the property.
+    SetOption(buf, 'bomb', charset ==# 'utf-8-bom' ? 1 : 0)
   endif
+  setbufvar(buf, 'simpleeditorconfig_bomb', !!getbufvar(buf, '&bomb'))
   var maximum = get(properties, 'max_line_length', '')
   if maximum ==# 'off'
     SetOption(buf, 'textwidth', 0)
@@ -453,7 +468,7 @@ def ApplyProperties(buf: number, properties: dict<string>, sources: list<string>
   setbufvar(buf, 'simpleeditorconfig_sources', sources)
   setbufvar(buf, 'simpleeditorconfig_trim',
     get(properties, 'trim_trailing_whitespace', '') ==# 'true')
-  if get(g:, 'simpleeditorconfig_verbose', 0)
+  if Flag('simpleeditorconfig_verbose', false)
     echomsg printf('[SimpleEditorConfig] %s: %d properties from %d file(s)',
       bufname(buf), len(properties), len(sources))
   endif
@@ -788,8 +803,8 @@ def Collect(buf: number, path: string, dirs: list<string>,
   MaybeFinish(state)
 enddef
 
-def ApplyRemote(buf: number, path: string)
-  if !get(g:, 'simpleeditorconfig_remote', 1)
+def ApplyRemote(buf: number, path: string, token: number)
+  if !Flag('simpleeditorconfig_remote', true)
       || !exists('*g:SimpleRemoteReadFile')
     return
   endif
@@ -797,27 +812,45 @@ def ApplyRemote(buf: number, path: string)
   if type(workspace) != v:t_dict
     workspace = {}
   endif
-  var root = substitute(get(workspace, 'root', ''), '/\+$', '', '')
+  var configured_root: any = get(workspace, 'root', '')
+  var root = type(configured_root) == v:t_string
+    ? substitute(configured_root, '\m/\+$', '', '') : ''
   if root ==# ''
     root = '/'
   endif
   if !UnderRoot(path, root)
     return
   endif
-  s_generation += 1
-  var token = s_generation
-  setbufvar(buf, 'simpleeditorconfig_token', token)
   Collect(buf, path, RemoteDirs(path, root), workspace, token)
 enddef
 
 export def Apply(buf: number = bufnr())
-  if !get(g:, 'simpleeditorconfig_enable', 1) || !bufexists(buf)
-      || getbufvar(buf, '&buftype') !~# '^\%(\|acwrite\)$'
+  if !bufexists(buf)
+    return
+  endif
+  # Every Apply() supersedes remote work for this buffer, including a local or
+  # disabled apply.  Previously only ApplyRemote() issued a token, so a buffer
+  # repurposed while reads were in flight could receive its correct local
+  # settings and then be overwritten by the older remote reply.
+  # A buffer-local token survives :source of this autoload script.  Seed the
+  # fresh script instance from it so a late closure created by the old instance
+  # can never share the new request's generation.
+  var previous = getbufvar(buf, 'simpleeditorconfig_token', 0)
+  if type(previous) == v:t_number && previous > s_generation
+    s_generation = previous
+  endif
+  s_generation += 1
+  var token = s_generation
+  setbufvar(buf, 'simpleeditorconfig_token', token)
+  var buftype = getbufvar(buf, '&buftype')
+  if !Flag('simpleeditorconfig_enable', true)
+      || (buftype !=# '' && buftype !=# 'acwrite')
     return
   endif
   var remote = getbufvar(buf, 'vimrc_remote', {})
-  if type(remote) == v:t_dict && !empty(get(remote, 'path', ''))
-    ApplyRemote(buf, remote.path)
+  var remote_path: any = type(remote) == v:t_dict ? get(remote, 'path', '') : ''
+  if type(remote_path) == v:t_string && !empty(remote_path)
+    ApplyRemote(buf, remote_path, token)
     return
   endif
   var name = bufname(buf)
@@ -881,9 +914,6 @@ export def BeforeWrite()
   finally
     winrestview(view)
   endtry
-  if get(b:, 'simpleeditorconfig_bomb', false)
-    setlocal bomb
-  endif
 enddef
 
 # How the current buffer relates to the SimpleRemote workspace, for Info().
@@ -927,7 +957,7 @@ enddef
 
 export def Health()
   echomsg 'SimpleEditorConfig health'
-  echomsg $'  enabled: {get(g:, "simpleeditorconfig_enable", 1) ? "yes" : "no"}'
+  echomsg $'  enabled: {Flag("simpleeditorconfig_enable", true) ? "yes" : "no"}'
   echomsg $'  remote reads: {exists("*g:SimpleRemoteReadFile") ? "available" : "absent"}'
   var workspace = WorkspaceLine()
   echomsg '  workspace: ' .. (empty(workspace) ? 'none' : workspace)
