@@ -1,6 +1,8 @@
 vim9script
 
 var s_generation = 0
+var s_read_encoding_generation = 0
+var s_read_encoding_stack: list<dict<any>> = []
 
 def Warn(message: string)
   echohl WarningMsg
@@ -32,15 +34,22 @@ def Parse(lines: list<string>): dict<any>
       add(result.sections, current)
       continue
     endif
-    var separator = match(line, '[:=]')
+    # EditorConfig is INI-like, but its key/value delimiter is specifically the
+    # first `=`.  Accepting `:` silently turned invalid lines into properties
+    # and made a value containing a colon depend on what preceded it.
+    var separator = match(line, '=')
     if separator < 0
       continue
     endif
     var key = tolower(trim(strpart(line, 0, separator)))
-    var value = tolower(trim(strpart(line, separator + 1)))
+    # Keys are normalized by the specification; arbitrary values are not.
+    # Preserve an unknown pair byte-for-byte (apart from required surrounding
+    # whitespace trimming), and normalize only the defined values where the
+    # plugin interprets them below.
+    var value = trim(strpart(line, separator + 1))
     if empty(current)
       if key ==# 'root'
-        result.root = value ==# 'true'
+        result.root = tolower(value) ==# 'true'
       endif
     elseif !empty(key)
       current.properties[key] = value
@@ -74,11 +83,10 @@ enddef
 # brace is already the literal we want for a comma-less group.
 const MAGIC = '\.*[]~^$'
 
-# Compiled section globs keyed by the raw pattern, holding the regex and the
-# bounds of every {n..m} range in it.  Compiling is a pure function of the
-# pattern and a project reuses the same handful of patterns for every buffer it
-# opens, so this only ever grows by the number of distinct patterns a session
-# has seen.
+# Compiled section globs keyed by the raw pattern.  Compiling is a pure function
+# of the pattern and a project reuses the same handful of patterns for every
+# buffer it opens, so this only ever grows by the number of distinct patterns a
+# session has seen.
 var s_globs: dict<dict<any>> = {}
 
 # `[abc]`, `[!abc]` and `[a-z]` map onto a Vim collection almost directly, but
@@ -172,11 +180,119 @@ def SplitChoices(body: list<string>): list<list<string>>
   return choices
 enddef
 
-# Compile one glob into a Vim regex fragment, appending the bounds of every
-# {n..m} it contains to `ranges` in the left-to-right order of the capture
-# groups it emits for them.  Works on a list of characters rather than the
-# string so that a multibyte pattern indexes the same way an ASCII one does.
-def CompileGlob(chars: list<string>, ranges: list<list<number>>): string
+# A run of decimal digits in a Vim regex, with no capture group.  Numeric range
+# globs cannot use one capture per range: Vim exposes only nine captures, so the
+# tenth range used to accept every integer without checking its bounds.
+def DigitRun(count: number): string
+  return count <= 0 ? '' : count == 1 ? '\d' : '\d\{' .. count .. '}'
+enddef
+
+def Alternatives(parts: list<string>): string
+  return empty(parts) ? '\%(\)\@!'
+    : len(parts) == 1 ? parts[0] : '\%(' .. join(parts, '\|') .. '\)'
+enddef
+
+# Match two non-negative, equally wide decimal strings inclusively.  This is a
+# compact decimal trie rather than an alternation of every number: {1..9999}
+# stays a handful of branches instead of becoming 9999 of them.  Leading zeroes
+# are possible here because this helper also compiles suffixes; UnsignedRange()
+# chooses a non-zero first digit for multi-digit numbers.
+def FixedDecimalRange(low: string, high: string): string
+  var width = strlen(low)
+  if low ==# high
+    return low
+  endif
+  if low ==# repeat('0', width) && high ==# repeat('9', width)
+    return DigitRun(width)
+  endif
+
+  var common = 0
+  while common < width
+      && strpart(low, common, 1) ==# strpart(high, common, 1)
+    common += 1
+  endwhile
+  var prefix = strpart(low, 0, common)
+  var low_digit = str2nr(strpart(low, common, 1))
+  var high_digit = str2nr(strpart(high, common, 1))
+  var rest = width - common - 1
+  var pieces: list<string> = []
+
+  var lower = string(low_digit)
+  if rest > 0
+    lower ..= FixedDecimalRange(strpart(low, common + 1), repeat('9', rest))
+  endif
+  add(pieces, lower)
+
+  if low_digit + 1 <= high_digit - 1
+    var middle_digit = low_digit + 1 == high_digit - 1
+      ? string(low_digit + 1)
+      : $'[{low_digit + 1}-{high_digit - 1}]'
+    add(pieces, middle_digit .. DigitRun(rest))
+  endif
+
+  var upper = string(high_digit)
+  if rest > 0
+    upper ..= FixedDecimalRange(repeat('0', rest),
+      strpart(high, common + 1))
+  endif
+  add(pieces, upper)
+  return prefix .. Alternatives(pieces)
+enddef
+
+def UnsignedRange(low: number, high: number): string
+  var parts: list<string> = []
+  var width = strlen(string(low))
+  var last_width = strlen(string(high))
+  while width <= last_width
+    var first = width == 1 ? 0 : str2nr('1' .. repeat('0', width - 1))
+    var last = str2nr(repeat('9', width))
+    var range_low = max([low, first])
+    var range_high = min([high, last])
+    if range_low <= range_high
+      add(parts, FixedDecimalRange(string(range_low), string(range_high)))
+    endif
+    width += 1
+  endwhile
+  return Alternatives(parts)
+enddef
+
+# Compile a signed integer interval directly into a non-capturing regex.  The
+# spellings accepted by the old numeric check are preserved: an optional `+`
+# on non-negative numbers and -0 are accepted, but multi-digit leading zeroes
+# are not.
+def NumberRange(low: number, high: number): string
+  if low > high
+    return '\%(\)\@!'
+  endif
+  var parts: list<string> = []
+  if low < 0
+    var negative_high = min([high, -1])
+    if low == v:numbermin
+      # abs(v:numbermin) is one larger than v:numbermax and cannot itself be a
+      # Vim Number.  Spell that single endpoint as text and compile the rest of
+      # the magnitude interval normally.
+      var magnitudes = negative_high == v:numbermin
+        ? [strpart(string(v:numbermin), 1)]
+        : [UnsignedRange(-negative_high, v:numbermax),
+          strpart(string(v:numbermin), 1)]
+      add(parts, '-' .. Alternatives(magnitudes))
+    else
+      add(parts, '-' .. UnsignedRange(-negative_high, -low))
+    endif
+  endif
+  if low <= 0 && high >= 0
+    add(parts, '[-+]\?0')
+  endif
+  if high > 0
+    add(parts, '+\?' .. UnsignedRange(max([low, 1]), high))
+  endif
+  return Alternatives(parts)
+enddef
+
+# Compile one glob into a Vim regex fragment.  Works on a list of characters
+# rather than the string so a multibyte pattern indexes the same way an ASCII
+# one does.
+def CompileGlob(chars: list<string>): string
   var out = ''
   var last = len(chars)
   var i = 0
@@ -227,26 +343,15 @@ def CompileGlob(chars: list<string>, ranges: list<list<number>>): string
       var bounds = matchlist(join(body, ''),
         '^\([-+]\?\d\+\)\.\.\([-+]\?\d\+\)$')
       if !empty(bounds)
-        # A range cannot become an alternation of the integers in it —
-        # `{1..9999}` would be 9999 branches — so the regex captures the digits
-        # and SectionMatches() compares them numerically.  Vim only has nine
-        # capture groups, so a tenth range in one pattern matches any integer
-        # unchecked; that is a wider match than the spec asks for, and it beats
-        # raising E872 from inside a BufReadPost.
-        if len(ranges) < 9
-          out ..= '\([-+]\?\d\+\)'
-          add(ranges, [str2nr(bounds[1]), str2nr(bounds[2])])
-        else
-          out ..= '\%([-+]\?\d\+\)'
-        endif
+        out ..= NumberRange(str2nr(bounds[1]), str2nr(bounds[2]))
       else
         var choices = SplitChoices(body)
         if len(choices) == 1
-          out ..= '{' .. CompileGlob(choices[0], ranges) .. '}'
+          out ..= '{' .. CompileGlob(choices[0]) .. '}'
         else
           var alternatives: list<string> = []
           for choice in choices
-            add(alternatives, CompileGlob(choice, ranges))
+            add(alternatives, CompileGlob(choice))
           endfor
           out ..= '\%(' .. join(alternatives, '\|') .. '\)'
         endif
@@ -281,8 +386,7 @@ def SectionGlob(pattern: string): dict<any>
       glob = strpart(glob, 3)
     endif
   endif
-  var ranges: list<list<number>> = []
-  var compiled: dict<any> = {regex: '', ranges: ranges, usable: true}
+  var compiled: dict<any> = {regex: '', usable: true}
   # Both halves of this are fallible and they fail for the same reason, so they
   # share one guard.  Not every collection a user can type is a collection Vim
   # will run: `[z-a]` is E944, and Vim only finds that out when the regex is
@@ -298,7 +402,7 @@ def SectionGlob(pattern: string): dict<any>
   # and a file name is not a search.
   try
     compiled.regex = '\m\C^' .. prefix
-      .. CompileGlob(split(glob, '\zs'), ranges) .. '$'
+      .. CompileGlob(split(glob, '\zs')) .. '$'
     var probe = 'x' =~# compiled.regex
   catch
     Warn(printf('ignoring section [%s]: %s', pattern,
@@ -316,31 +420,7 @@ def SectionMatches(pattern: string, config_dir: string, path: string): bool
   if !compiled.usable
     return false
   endif
-  if empty(compiled.ranges)
-    return relative =~# compiled.regex
-  endif
-  var matched = matchlist(relative, compiled.regex)
-  if empty(matched)
-    return false
-  endif
-  var group = 1
-  for bounds in compiled.ranges
-    var digits = matched[group]
-    group += 1
-    if empty(digits)
-      # This range sat in a brace alternative that was not the one taken.
-      continue
-    endif
-    if digits =~# '^[-+]\?0\d'
-      # A name spelled 007 is not the integer 7 for the purpose of `{1..100}`.
-      return false
-    endif
-    var value = str2nr(digits)
-    if value < bounds[0] || value > bounds[1]
-      return false
-    endif
-  endfor
-  return true
+  return relative =~# compiled.regex
 enddef
 
 def Effective(configs: list<dict<any>>, path: string): dict<string>
@@ -351,7 +431,7 @@ def Effective(configs: list<dict<any>>, path: string): dict<string>
         continue
       endif
       for [key, value] in items(section.properties)
-        if value ==# 'unset'
+        if tolower(value) ==# 'unset'
           # `unset` takes back a value an earlier section gave, and a section is
           # perfectly entitled to unset something nothing ever set — a child
           # .editorconfig that clears a key its parent happens not to define.
@@ -373,21 +453,29 @@ enddef
 def BufferBaseline(buf: number): dict<any>
   var existing = getbufvar(buf, 'simpleeditorconfig_baseline', {})
   if type(existing) == v:t_dict && !empty(existing)
+    setbufvar(buf, 'simpleeditorconfig_pre_read_fileencoding', v:null)
     return existing
   endif
+  var pre_read_fileencoding: any = getbufvar(buf,
+    'simpleeditorconfig_pre_read_fileencoding', v:null)
   var baseline = {
     expandtab: getbufvar(buf, '&expandtab'),
     shiftwidth: getbufvar(buf, '&shiftwidth'),
     softtabstop: getbufvar(buf, '&softtabstop'),
     tabstop: getbufvar(buf, '&tabstop'),
     fileformat: getbufvar(buf, '&fileformat'),
-    fileencoding: getbufvar(buf, '&fileencoding'),
+    # BeforeRead may have forced decoding through global 'fileencodings'.  The
+    # resulting local value belongs to EditorConfig, not to the editor state
+    # RestoreBaseline must recover if `charset` is later removed.
+    fileencoding: type(pre_read_fileencoding) == v:t_string
+      ? pre_read_fileencoding : getbufvar(buf, '&fileencoding'),
     bomb: getbufvar(buf, '&bomb'),
     textwidth: getbufvar(buf, '&textwidth'),
     fixendofline: getbufvar(buf, '&fixendofline'),
     endofline: getbufvar(buf, '&endofline'),
   }
   setbufvar(buf, 'simpleeditorconfig_baseline', baseline)
+  setbufvar(buf, 'simpleeditorconfig_pre_read_fileencoding', v:null)
   return baseline
 enddef
 
@@ -405,17 +493,39 @@ def Positive(value: string): number
   return value =~# '^\d\+$' && str2nr(value) > 0 ? str2nr(value) : 0
 enddef
 
+def CharsetEncoding(charset: string): string
+  return get({
+    'utf-8': 'utf-8',
+    'utf-8-bom': 'utf-8',
+    latin1: 'latin1',
+    # Vim's ucs-2 encodings cannot represent surrogate pairs.  Its utf-16
+    # names are the corresponding big- and little-endian encodings and retain
+    # non-BMP characters on both read and write.
+    'utf-16be': 'utf-16',
+    'utf-16le': 'utf-16le',
+  }, tolower(charset), '')
+enddef
+
 def ApplyProperties(buf: number, properties: dict<string>, sources: list<string>)
   if !bufexists(buf)
     return
   endif
   RestoreBaseline(buf)
-  var tab_width = Positive(get(properties, 'tab_width', ''))
-  var indent_size = get(properties, 'indent_size', '') ==# 'tab'
-    ? tab_width : Positive(get(properties, 'indent_size', ''))
-  if get(properties, 'indent_style', '') ==# 'space'
+  var configured_tab_width = Positive(get(properties, 'tab_width', ''))
+  var indent_value = tolower(get(properties, 'indent_size', ''))
+  var indent_size = indent_value ==# 'tab'
+    ? (configured_tab_width > 0
+      ? configured_tab_width : getbufvar(buf, '&tabstop'))
+    : Positive(indent_value)
+  # Per EditorConfig, tab_width defaults to a numeric indent_size regardless
+  # of indent_style.  Previously that inheritance happened only for spaces,
+  # leaving `indent_style = tab, indent_size = 4` at the editor's old tabstop.
+  var tab_width = configured_tab_width > 0
+    ? configured_tab_width : indent_size
+  var indent_style = tolower(get(properties, 'indent_style', ''))
+  if indent_style ==# 'space'
     SetOption(buf, 'expandtab', 1)
-  elseif get(properties, 'indent_style', '') ==# 'tab'
+  elseif indent_style ==# 'tab'
     SetOption(buf, 'expandtab', 0)
   endif
   if tab_width > 0
@@ -424,25 +534,16 @@ def ApplyProperties(buf: number, properties: dict<string>, sources: list<string>
   if indent_size > 0
     SetOption(buf, 'shiftwidth', indent_size)
     SetOption(buf, 'softtabstop', indent_size)
-    if tab_width == 0 && get(properties, 'indent_style', '') ==# 'space'
-      SetOption(buf, 'tabstop', indent_size)
-    endif
   endif
   var endings = {lf: 'unix', crlf: 'dos', cr: 'mac'}
-  var ending = get(properties, 'end_of_line', '')
+  var ending = tolower(get(properties, 'end_of_line', ''))
   if has_key(endings, ending)
     SetOption(buf, 'fileformat', endings[ending])
   endif
-  var charsets = {
-    'utf-8': 'utf-8',
-    'utf-8-bom': 'utf-8',
-    latin1: 'latin1',
-    'utf-16be': 'ucs-2be',
-    'utf-16le': 'ucs-2le',
-  }
-  var charset = get(properties, 'charset', '')
-  if has_key(charsets, charset)
-    SetOption(buf, 'fileencoding', charsets[charset])
+  var charset = tolower(get(properties, 'charset', ''))
+  var encoding = CharsetEncoding(charset)
+  if !empty(encoding)
+    SetOption(buf, 'fileencoding', encoding)
     # 'bomb' is independent of trailing-whitespace cleanup.  Keeping it as a
     # deferred flag in BeforeWrite() meant `charset = utf-8-bom` did nothing
     # unless the same section also enabled trim_trailing_whitespace.  Set the
@@ -451,27 +552,147 @@ def ApplyProperties(buf: number, properties: dict<string>, sources: list<string>
     SetOption(buf, 'bomb', charset ==# 'utf-8-bom' ? 1 : 0)
   endif
   setbufvar(buf, 'simpleeditorconfig_bomb', !!getbufvar(buf, '&bomb'))
-  var maximum = get(properties, 'max_line_length', '')
+  var maximum = tolower(get(properties, 'max_line_length', ''))
   if maximum ==# 'off'
     SetOption(buf, 'textwidth', 0)
   elseif Positive(maximum) > 0
     SetOption(buf, 'textwidth', Positive(maximum))
   endif
-  if has_key(properties, 'insert_final_newline')
-    var final_newline = properties.insert_final_newline ==# 'true'
-    SetOption(buf, 'fixendofline', final_newline ? 1 : 0)
-    if final_newline
-      SetOption(buf, 'endofline', 1)
-    endif
+  var final_newline = tolower(get(properties, 'insert_final_newline', ''))
+  if final_newline ==# 'true'
+    SetOption(buf, 'fixendofline', 1)
+    SetOption(buf, 'endofline', 1)
+  elseif final_newline ==# 'false'
+    # 'fixendofline' only stops Vim from repairing a missing newline.  'eol'
+    # records whether this buffer is meant to have one at all and must be
+    # cleared as well to ensure the next write removes an existing terminator.
+    SetOption(buf, 'fixendofline', 0)
+    SetOption(buf, 'endofline', 0)
   endif
   setbufvar(buf, 'simpleeditorconfig', properties)
   setbufvar(buf, 'simpleeditorconfig_sources', sources)
   setbufvar(buf, 'simpleeditorconfig_trim',
-    get(properties, 'trim_trailing_whitespace', '') ==# 'true')
+    tolower(get(properties, 'trim_trailing_whitespace', '')) ==# 'true')
   if Flag('simpleeditorconfig_verbose', false)
     echomsg printf('[SimpleEditorConfig] %s: %d properties from %d file(s)',
       bufname(buf), len(properties), len(sources))
   endif
+enddef
+
+# 'fileencoding' is assigned only after Vim has decoded a file, so changing it
+# on BufReadPost controls the next write but cannot repair text already read as
+# bytes.  The encoding candidates in 'fileencodings' are consulted after
+# BufReadPre, however.  Temporarily narrow that global list to the charset the
+# applicable .editorconfig declares, then restore the exact user value as soon
+# as the read completes.  Reads are synchronous; the per-buffer saved value
+# also forms a stack if another buffer is opened by a BufReadPre autocmd.
+def ClearReadEncodingBufferState(entry: dict<any>)
+  var buf = get(entry, 'buf', -1)
+  if bufexists(buf)
+      && getbufvar(buf, 'simpleeditorconfig_read_encoding_token', -1)
+        == get(entry, 'token', -2)
+    setbufvar(buf, 'simpleeditorconfig_saved_fileencodings', v:null)
+    setbufvar(buf, 'simpleeditorconfig_read_encoding_token', -1)
+  endif
+enddef
+
+def DrainReadEncodingStack()
+  while !empty(s_read_encoding_stack)
+      && !!get(s_read_encoding_stack[-1], 'restore_requested', false)
+    var entry = remove(s_read_encoding_stack, -1)
+    var timer = get(entry, 'timer', 0)
+    if timer > 0
+      timer_stop(timer)
+    endif
+    var saved: any = get(entry, 'saved', v:null)
+    if type(saved) == v:t_string
+      &g:fileencodings = saved
+    endif
+    ClearReadEncodingBufferState(entry)
+  endwhile
+enddef
+
+def RequestReadEncodingRestore(buf: number, token: number = -1)
+  var idx = len(s_read_encoding_stack) - 1
+  while idx >= 0
+    var entry = s_read_encoding_stack[idx]
+    if get(entry, 'buf', -1) == buf
+        && (token < 0 || get(entry, 'token', -2) == token)
+      entry.restore_requested = true
+      DrainReadEncodingStack()
+      return
+    endif
+    idx -= 1
+  endwhile
+enddef
+
+def ReadEncodingFallback(token: number, timer: number)
+  var idx = len(s_read_encoding_stack) - 1
+  while idx >= 0
+    var entry = s_read_encoding_stack[idx]
+    if get(entry, 'token', -1) == token
+        && get(entry, 'timer', -2) == timer
+      entry.timer = 0
+      entry.restore_requested = true
+      DrainReadEncodingStack()
+      return
+    endif
+    idx -= 1
+  endwhile
+enddef
+
+export def BeforeRead(buf: number = bufnr())
+  RestoreReadEncoding(buf)
+  if !bufexists(buf) || !Flag('simpleeditorconfig_enable', true)
+      || getbufvar(buf, '&buftype') !=# ''
+    return
+  endif
+  var name = bufname(buf)
+  if empty(name) || name =~# '^\a[[:alnum:]+.-]*://'
+    return
+  endif
+  var path = resolve(fnamemodify(name, ':p'))
+  var configs = LocalConfigs(path, ProjectionRoot(path))
+  var charset = get(Effective(configs, path), 'charset', '')
+  var encoding = CharsetEncoding(charset)
+  if empty(encoding)
+    return
+  endif
+  var baseline: any = getbufvar(buf, 'simpleeditorconfig_baseline', {})
+  var pre_read: any = getbufvar(buf,
+    'simpleeditorconfig_pre_read_fileencoding', v:null)
+  if (type(baseline) != v:t_dict || empty(baseline))
+      && type(pre_read) != v:t_string
+    setbufvar(buf, 'simpleeditorconfig_pre_read_fileencoding',
+      getbufvar(buf, '&fileencoding'))
+  endif
+  s_read_encoding_generation += 1
+  if s_read_encoding_generation <= 0
+    s_read_encoding_generation = 1
+  endif
+  var entry: dict<any> = {
+    buf: buf,
+    token: s_read_encoding_generation,
+    saved: &g:fileencodings,
+    timer: 0,
+    restore_requested: false,
+  }
+  add(s_read_encoding_stack, entry)
+  setbufvar(buf, 'simpleeditorconfig_saved_fileencodings', entry.saved)
+  setbufvar(buf, 'simpleeditorconfig_read_encoding_token', entry.token)
+  &g:fileencodings = encoding
+  entry.timer = timer_start(0,
+    function(ReadEncodingFallback, [entry.token]))
+enddef
+
+export def RestoreReadEncoding(buf: number = bufnr())
+  var token: any = getbufvar(buf, 'simpleeditorconfig_read_encoding_token', -1)
+  RequestReadEncodingRestore(buf, type(token) == v:t_number ? token : -1)
+enddef
+
+export def AfterRead(buf: number = bufnr())
+  RestoreReadEncoding(buf)
+  Apply(buf)
 enddef
 
 # Parsed .editorconfig files keyed by their full path.  Every file opened in a

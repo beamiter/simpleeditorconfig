@@ -22,7 +22,13 @@ command! SimpleEditorConfigHealth simpleeditorconfig#Health()
 
 augroup SimpleEditorConfig
   autocmd!
-  autocmd BufReadPost,BufNewFile * simpleeditorconfig#Apply(bufnr())
+  autocmd BufReadPre * simpleeditorconfig#BeforeRead(bufnr())
+  autocmd BufReadPost * simpleeditorconfig#AfterRead(bufnr())
+  # A failed read may not emit BufReadPost.  The generation-bound fallback
+  # timer is the primary cleanup; leaving or unloading the failed buffer gives
+  # it an additional synchronous recovery path.
+  autocmd BufEnter,BufLeave,BufUnload * simpleeditorconfig#RestoreReadEncoding(str2nr(expand('<abuf>')))
+  autocmd BufNewFile * simpleeditorconfig#Apply(bufnr())
   autocmd BufWritePre * simpleeditorconfig#BeforeWrite()
   autocmd BufWritePost * simpleeditorconfig#AfterWrite()
   # SimpleRemote fills remote:// buffers through a BufReadCmd, which

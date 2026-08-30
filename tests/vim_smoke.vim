@@ -46,6 +46,168 @@ simpleeditorconfig#BeforeWrite()
 assert_equal('print("ok")', getline(1))
 
 # ---------------------------------------------------------------------------
+# Local read/write semantics that have to be in place before BufReadPost.
+
+# A no-BOM UTF-16 file cannot be decoded after the read has happened, and
+# Vim's ucs-2 encodings lose surrogate pairs on write.  The configured charset
+# must drive the initial read, preserve a non-BMP character and restore the
+# user's global detection list immediately afterwards.
+mkdir(BASE .. '/utf16', 'p')
+writefile([
+  'root = true',
+  '[*.le]',
+  'charset = utf-16le',
+  '[*.be]',
+  'charset = utf-16be',
+], BASE .. '/utf16/.editorconfig')
+const UTF16LE = 0z41003DD800DE0A00
+const UTF16BE = 0z0041D83DDE00000A
+writefile(UTF16LE, BASE .. '/utf16/value.le')
+writefile(UTF16BE, BASE .. '/utf16/value.be')
+var saved_fileencodings = &g:fileencodings
+execute 'edit! ' .. fnameescape(BASE .. '/utf16/value.le')
+var utf16le_buf = bufnr()
+assert_equal('A😀', getline(1), 'UTF-16LE was decoded after BufReadPost')
+assert_equal('utf-16le', &l:fileencoding)
+assert_equal('', b:simpleeditorconfig_baseline.fileencoding,
+  'the forced decoder leaked into the editor-option baseline')
+assert_equal(saved_fileencodings, &g:fileencodings,
+  'the UTF-16 read leaked a forced global fileencodings value')
+write
+assert_equal(UTF16LE, readblob(BASE .. '/utf16/value.le'),
+  'UTF-16LE non-BMP text did not round-trip')
+execute 'edit! ' .. fnameescape(BASE .. '/utf16/value.be')
+assert_equal('A😀', getline(1), 'UTF-16BE was decoded after BufReadPost')
+assert_equal('utf-16', &l:fileencoding)
+assert_equal(saved_fileencodings, &g:fileencodings)
+write
+assert_equal(UTF16BE, readblob(BASE .. '/utf16/value.be'),
+  'UTF-16BE non-BMP text did not round-trip')
+
+# A later BufReadPre handler can abort the read before BufReadPost gets a
+# chance to restore the global candidate list.  The fallback timer must clean
+# that path without requiring the failed buffer to be entered again.
+writefile(UTF16LE, BASE .. '/utf16/broken.le')
+augroup SimpleEditorConfigForcedReadFailure
+  autocmd!
+  autocmd BufReadPre */broken.le throw 'forced read failure'
+augroup END
+try
+  execute 'edit! ' .. fnameescape(BASE .. '/utf16/broken.le')
+catch /forced read failure/
+endtry
+sleep 10m
+assert_equal(saved_fileencodings, &g:fileencodings,
+  'a failed BufReadPre leaked the forced global fileencodings value')
+augroup SimpleEditorConfigForcedReadFailure
+  autocmd!
+augroup END
+
+# Nested reads restore in LIFO order.  Asking the outer owner to restore first
+# must not overwrite the inner decoder, and stopped fallback timers must not
+# later overwrite the fully restored user value.
+var utf16be_buf = bufnr(BASE .. '/utf16/value.be')
+simpleeditorconfig#BeforeRead(utf16le_buf)
+assert_equal('utf-16le', &g:fileencodings)
+simpleeditorconfig#BeforeRead(utf16be_buf)
+assert_equal('utf-16', &g:fileencodings)
+simpleeditorconfig#RestoreReadEncoding(utf16le_buf)
+assert_equal('utf-16', &g:fileencodings,
+  'an outer restore overwrote the active nested decoder')
+simpleeditorconfig#RestoreReadEncoding(utf16be_buf)
+assert_equal(saved_fileencodings, &g:fileencodings)
+sleep 10m
+assert_equal(saved_fileencodings, &g:fileencodings,
+  'a stale read-encoding timer overwrote the restored user value')
+
+# Removing charset later restores the option that existed before the forced
+# read, not the encoding selected by that forced read itself.
+writefile(['root = true', '[*.be]', 'charset = utf-16be'],
+  BASE .. '/utf16/.editorconfig')
+execute 'buffer ' .. utf16le_buf
+simpleeditorconfig#Reload(utf16le_buf)
+assert_equal('', &l:fileencoding,
+  'removing charset restored the forced decoder instead of the baseline')
+
+# tab_width defaults to a numeric indent_size even when tabs are the indentation
+# style.  indent_size = tab in turn resolves through an explicit tab_width.
+mkdir(BASE .. '/indent', 'p')
+writefile([
+  'root = true',
+  '[*.tabs]',
+  'indent_style = tab',
+  'indent_size = 4',
+  '[*.tabsize]',
+  'indent_style = tab',
+  'indent_size = tab',
+  'tab_width = 3',
+  '[*.editor-tab]',
+  'indent_style = tab',
+  'indent_size = tab',
+], BASE .. '/indent/.editorconfig')
+writefile(['payload'], BASE .. '/indent/value.tabs')
+writefile(['payload'], BASE .. '/indent/value.tabsize')
+writefile(['payload'], BASE .. '/indent/value.editor-tab')
+execute 'edit! ' .. fnameescape(BASE .. '/indent/value.tabs')
+assert_false(&l:expandtab)
+assert_equal([4, 4, 4], [&l:tabstop, &l:shiftwidth, &l:softtabstop],
+  'numeric indent_size did not supply the implicit tab_width')
+execute 'edit! ' .. fnameescape(BASE .. '/indent/value.tabsize')
+assert_equal([3, 3, 3], [&l:tabstop, &l:shiftwidth, &l:softtabstop],
+  'indent_size = tab did not inherit tab_width')
+g:simpleeditorconfig_enable = 0
+execute 'edit! ' .. fnameescape(BASE .. '/indent/value.editor-tab')
+setlocal tabstop=6 shiftwidth=2 softtabstop=2
+g:simpleeditorconfig_enable = 1
+simpleeditorconfig#Apply(bufnr())
+assert_equal([6, 6, 6], [&l:tabstop, &l:shiftwidth, &l:softtabstop],
+  'indent_size = tab did not fall back to the editor tab size')
+
+# `:` is not an EditorConfig pair delimiter; only the first `=` is.  A valid
+# property beside the invalid line proves the section itself still applies.
+mkdir(BASE .. '/separator', 'p')
+writefile([
+  'root = TRUE', '[*.txt]', 'indent_size: 7', 'tab_width = 3',
+  'custom = AbC=Right',
+], BASE .. '/separator/.editorconfig')
+writefile(['payload'], BASE .. '/separator/value.txt')
+execute 'edit! ' .. fnameescape(BASE .. '/separator/value.txt')
+assert_false(has_key(b:simpleeditorconfig, 'indent_size'),
+  'a colon-delimited line was parsed as a property')
+assert_equal('3', b:simpleeditorconfig.tab_width)
+assert_equal('AbC=Right', b:simpleeditorconfig.custom,
+  'the parser lowercased an unknown value or split after its first equals sign')
+
+# false removes an existing final newline on the next write; true must still
+# leave an empty file empty.  Unsupported values restore editor defaults.
+mkdir(BASE .. '/final-newline', 'p')
+writefile([
+  'root = true', '[*.txt]', 'insert_final_newline = FALSE',
+], BASE .. '/final-newline/.editorconfig')
+writefile(['payload'], BASE .. '/final-newline/value.txt')
+execute 'edit! ' .. fnameescape(BASE .. '/final-newline/value.txt')
+assert_false(&l:fixendofline)
+assert_false(&l:endofline)
+write
+var without_newline = readblob(BASE .. '/final-newline/value.txt')
+assert_equal(char2nr('d'), without_newline[-1],
+  'insert_final_newline = false left a line terminator on disk')
+writefile([
+  'root = true', '[*.txt]', 'insert_final_newline = sometimes',
+], BASE .. '/final-newline/.editorconfig')
+simpleeditorconfig#Reload(bufnr())
+assert_true(&l:fixendofline)
+assert_true(&l:endofline)
+writefile([
+  'root = true', '[*.empty]', 'insert_final_newline = true',
+], BASE .. '/final-newline/.editorconfig')
+writefile([], BASE .. '/final-newline/value.empty')
+execute 'edit! ' .. fnameescape(BASE .. '/final-newline/value.empty')
+write
+assert_equal(0, getfsize(BASE .. '/final-newline/value.empty'),
+  'insert_final_newline = true added a newline to an empty file')
+
+# ---------------------------------------------------------------------------
 # Virtual-mode remote:// buffers.  g:SimpleRemoteReadFile is stubbed the way
 # SimpleRemote answers: (ok, body) with the agent's `not a file: <path>` for a
 # missing file, or a synchronous failure and -1 when no workspace is ready.

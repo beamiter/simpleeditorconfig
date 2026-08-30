@@ -96,16 +96,17 @@ const CASES: list<list<any>> = [
     ['f0.txt', 'f11.txt', 'f07.txt']],
   ['n{1..100}.txt', ['n1.txt', 'n50.txt', 'n100.txt'],
     ['n0.txt', 'n200.txt', 'n007.txt']],
+  ['wide{1..9999}.txt', ['wide1.txt', 'wide999.txt', 'wide9999.txt'],
+    ['wide0.txt', 'wide10000.txt', 'wide0001.txt']],
   # Deviation: the reference rejects the name `0` here, we accept it.
   ['x{-2..2}.c', ['x-2.c', 'x-1.c', 'x0.c', 'x2.c'],
     ['x-3.c', 'x3.c', 'x00.c']],
-  # Vim has nine capture groups and a tenth `\(` is E872, thrown from inside a
-  # BufReadPost.  A tenth range in one pattern therefore matches any integer
-  # without its bounds being checked — j9 below is outside {1..3} and matches —
-  # which is a wider answer than the spec asks for and not an error message.
+  # Every range must be checked even after Vim's nine-capture limit.  The old
+  # matcher made the tenth range non-capturing and therefore accepted j9.
   ['a{1..3}b{1..3}c{1..3}d{1..3}e{1..3}f{1..3}g{1..3}h{1..3}i{1..3}j{1..3}.txt',
-    ['a1b1c1d1e1f1g1h1i1j1.txt', 'a1b1c1d1e1f1g1h1i1j9.txt'],
-    ['a9b1c1d1e1f1g1h1i1j1.txt', 'a1b1c1d1e1f1g1h1i1.txt']],
+    ['a1b1c1d1e1f1g1h1i1j1.txt'],
+    ['a9b1c1d1e1f1g1h1i1j1.txt', 'a1b1c1d1e1f1g1h1i1j9.txt',
+      'a1b1c1d1e1f1g1h1i1.txt']],
 
   # Escapes.  Deviations: the reference matches every .c file for the first of
   # these, and raises an exception rather than answering for the second.
@@ -185,10 +186,9 @@ assert_equal('2',
   'a section too deeply nested to compile must not take the file down with it')
 
 # 'ignorecase' and 'nomagic' are the user's business and neither may change what
-# a section glob means.  matchlist(), which the numeric-range path uses, honours
-# 'ignorecase'; and under 'nomagic' every `.` and `*` in a compiled glob would
-# stop meaning what it was compiled to mean.  The regex carries `\m\C` for that
-# reason, and these four cases are what would break without it.
+# a section glob means.  Under 'nomagic' every `.` and `*` in a compiled glob
+# would stop meaning what it was compiled to mean.  The regex carries `\m\C`
+# for that reason, and these four cases are what would break without it.
 set ignorecase nomagic
 assert_true(Matches('*.c', 'x.c'))
 assert_false(Matches('*.c', 'XX.C'))
