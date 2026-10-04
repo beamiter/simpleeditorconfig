@@ -18,6 +18,38 @@ def Flag(name: string, fallback: bool): bool
   return type(configured) == v:t_number ? configured != 0 : fallback
 enddef
 
+# EditorConfig values may be double-quoted, and a `#` or `;` starts an inline
+# comment only when it is preceded by whitespace — `foo#bar` is a value, `foo
+# bar` is `foo` plus a comment.  Quoted text keeps interior hashes and
+# unescapes `\"` and `\\`.
+def ParseValue(raw: string): string
+  var text = trim(raw)
+  if strpart(text, 0, 1) ==# '"'
+    var out = ''
+    var i = 1
+    var last = strlen(text)
+    while i < last
+      var char = strpart(text, i, 1)
+      if char ==# '\' && i + 1 < last
+        var next = strpart(text, i + 1, 1)
+        if next ==# '"' || next ==# '\'
+          out ..= next
+          i += 2
+          continue
+        endif
+      endif
+      if char ==# '"'
+        return out
+      endif
+      out ..= char
+      i += 1
+    endwhile
+    return out
+  endif
+  var cut = match(text, '\m\s\+[;#]')
+  return cut < 0 ? text : strpart(text, 0, cut)
+enddef
+
 def Parse(lines: list<string>): dict<any>
   var result: dict<any> = {root: false, sections: []}
   var current: dict<any> = {}
@@ -42,11 +74,7 @@ def Parse(lines: list<string>): dict<any>
       continue
     endif
     var key = tolower(trim(strpart(line, 0, separator)))
-    # Keys are normalized by the specification; arbitrary values are not.
-    # Preserve an unknown pair byte-for-byte (apart from required surrounding
-    # whitespace trimming), and normalize only the defined values where the
-    # plugin interprets them below.
-    var value = trim(strpart(line, separator + 1))
+    var value = ParseValue(strpart(line, separator + 1))
     if empty(current)
       if key ==# 'root'
         result.root = tolower(value) ==# 'true'
@@ -1078,6 +1106,13 @@ export def Apply(buf: number = bufnr())
   if empty(name)
     return
   endif
+  # BufReadPre already skips URI names so a failed SimpleRemote handshake
+  # cannot be answered from this machine's ~/.editorconfig.  Apply() used to
+  # walk fnamemodify(name, ':p') for `remote://...` buffers that had no
+  # b:vimrc_remote dict yet, treating the URI as a local relative path.
+  if name =~# '^\a[[:alnum:]+.-]*://'
+    return
+  endif
   var path = resolve(fnamemodify(name, ':p'))
   var configs = LocalConfigs(path, ProjectionRoot(path))
   ApplyProperties(buf, Effective(configs, path),
@@ -1179,7 +1214,13 @@ enddef
 export def Health()
   echomsg 'SimpleEditorConfig health'
   echomsg $'  enabled: {Flag("simpleeditorconfig_enable", true) ? "yes" : "no"}'
-  echomsg $'  remote reads: {exists("*g:SimpleRemoteReadFile") ? "available" : "absent"}'
+  var remote = 'absent'
+  if !Flag('simpleeditorconfig_remote', true)
+    remote = 'disabled'
+  elseif exists('*g:SimpleRemoteReadFile')
+    remote = 'available'
+  endif
+  echomsg $'  remote reads: {remote}'
   var workspace = WorkspaceLine()
   echomsg '  workspace: ' .. (empty(workspace) ? 'none' : workspace)
   echomsg $'  remote cache: {len(s_remote_parsed)} file(s)'

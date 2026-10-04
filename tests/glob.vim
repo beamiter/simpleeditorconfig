@@ -116,7 +116,7 @@ const CASES: list<list<any>> = [
   ['\?.c', ['?.c'], ['a.c']],
 
   # Names that look like patterns are still just names.
-  ['*.c', ['a.c', '.c', '*.c', 'lib/deep/x.c'], ['a.h', 'a.c.bak']],
+  ['{0..0}.txt', ['0.txt'], ['00.txt', '1.txt']],
 ]
 
 const BASE = tempname()

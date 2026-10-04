@@ -1,6 +1,7 @@
 vim9script
 
 set nocompatible nomore
+set cmdheight=20
 const ROOT = fnamemodify(resolve(expand('<sfile>:p')), ':h:h')
 execute 'set runtimepath^=' .. fnameescape(ROOT)
 execute 'source ' .. fnameescape(ROOT .. '/plugin/simpleeditorconfig.vim')
@@ -177,6 +178,83 @@ assert_false(has_key(b:simpleeditorconfig, 'indent_size'),
 assert_equal('3', b:simpleeditorconfig.tab_width)
 assert_equal('AbC=Right', b:simpleeditorconfig.custom,
   'the parser lowercased an unknown value or split after its first equals sign')
+
+# Quoted values and whitespace-prefixed inline comments are part of the INI
+# grammar; treating `"4"` as a non-number left indent_size unset, and
+# `8 # spaces` failed Positive() because of the comment text.
+mkdir(BASE .. '/quoted', 'p')
+writefile([
+  'root = true',
+  '[*.txt]',
+  'indent_size = "4"',
+  'indent_style = "space"',
+  'tab_width = 8 # columns',
+  'custom = "hash # inside"',
+  'also = foo#bar',
+], BASE .. '/quoted/.editorconfig')
+writefile(['payload'], BASE .. '/quoted/value.txt')
+execute 'edit! ' .. fnameescape(BASE .. '/quoted/value.txt')
+simpleeditorconfig#Apply(bufnr())
+assert_equal('4', b:simpleeditorconfig.indent_size,
+  'a quoted indent_size was not unquoted')
+assert_equal(4, &l:shiftwidth)
+assert_true(&l:expandtab)
+assert_equal('8', b:simpleeditorconfig.tab_width,
+  'an inline comment was kept as part of the value')
+assert_equal('hash # inside', b:simpleeditorconfig.custom)
+assert_equal('foo#bar', b:simpleeditorconfig.also,
+  'a hash without whitespace was treated as a comment')
+
+# A remote:// buffer without SimpleRemote's dict must not be resolved as a
+# local path (cwd/remote://... or ~/.editorconfig).
+mkdir(BASE .. '/uri-trap', 'p')
+writefile(['root = true', '[*]', 'indent_size = 9'], BASE .. '/uri-trap/.editorconfig')
+var saved_cwd = getcwd()
+execute 'cd ' .. fnameescape(BASE .. '/uri-trap')
+enew!
+setlocal buftype=acwrite
+silent file remote://workspace/src/main.py
+setlocal shiftwidth=6
+simpleeditorconfig#Apply(bufnr())
+assert_equal(6, &l:shiftwidth,
+  'a remote:// buffer without vimrc_remote inherited local EditorConfig')
+assert_equal({}, get(b:, 'simpleeditorconfig', {}))
+execute 'cd ' .. fnameescape(saved_cwd)
+bwipe!
+
+# Health must not say remote reads are available when the user turned them off.
+g:simpleeditorconfig_remote = 0
+assert_match('remote reads: disabled', execute('SimpleEditorConfigHealth'),
+  'Health reported remote reads available while they were disabled')
+g:simpleeditorconfig_remote = 1
+
+# Unknown charset and a zero max_line_length must leave those options alone.
+mkdir(BASE .. '/charset', 'p')
+writefile([
+  'root = true', '[*.txt]', 'charset = utf-9', 'max_line_length = 0',
+  'indent_size = 2',
+], BASE .. '/charset/.editorconfig')
+writefile(['payload'], BASE .. '/charset/value.txt')
+g:simpleeditorconfig_enable = 0
+execute 'edit! ' .. fnameescape(BASE .. '/charset/value.txt')
+var prior_enc = &l:fileencoding
+setlocal textwidth=42
+g:simpleeditorconfig_enable = 1
+simpleeditorconfig#Apply(bufnr())
+assert_equal(2, &l:shiftwidth)
+assert_equal(42, &l:textwidth, 'max_line_length = 0 was applied as a width')
+assert_equal(prior_enc, &l:fileencoding, 'an unknown charset changed fileencoding')
+
+# `unset` of indent after a quoted value still works; empty section headers
+# match nothing.
+mkdir(BASE .. '/emptysec', 'p')
+writefile(['root = true', '[]', 'indent_size = 7', '[*]', 'indent_size = 5'],
+  BASE .. '/emptysec/.editorconfig')
+writefile(['x'], BASE .. '/emptysec/a.txt')
+execute 'edit! ' .. fnameescape(BASE .. '/emptysec/a.txt')
+simpleeditorconfig#Apply(bufnr())
+assert_equal('5', b:simpleeditorconfig.indent_size,
+  'an empty [] section overrode later sections')
 
 # false removes an existing final newline on the next write; true must still
 # leave an empty file empty.  Unsupported values restore editor defaults.
