@@ -55,10 +55,10 @@ def Parse(lines: list<string>): dict<any>
   var current: dict<any> = {}
   for raw in lines
     var line = trim(raw)
-    if empty(line) || line =~# '^[#;]'
+    if empty(line) || line =~# '\m^[#;]'
       continue
     endif
-    if line =~# '^\[.*\]$'
+    if line =~# '\m^\[.*\]$'
       current = {
         pattern: strpart(line, 1, strlen(line) - 2),
         properties: {},

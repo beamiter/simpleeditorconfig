@@ -36,6 +36,7 @@ writefile([
 ], BASE .. '/src/.editorconfig')
 writefile(['print("ok")  '], BASE .. '/src/nested/main.py')
 
+set nomagic
 execute 'edit ' .. fnameescape(BASE .. '/src/nested/main.py')
 simpleeditorconfig#Apply(bufnr())
 assert_true(&l:expandtab)
@@ -43,6 +44,7 @@ assert_equal(3, &l:shiftwidth)
 assert_equal(3, &l:softtabstop)
 assert_equal(88, &l:textwidth)
 assert_equal(2, len(b:simpleeditorconfig_sources))
+set magic
 simpleeditorconfig#BeforeWrite()
 assert_equal('print("ok")', getline(1))
 
