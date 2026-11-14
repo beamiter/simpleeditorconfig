@@ -740,8 +740,8 @@ enddef
 # by a few milliseconds around a second boundary, and a stamp that is a second
 # ahead of localtime() is what turned "not the current second" into a stale
 # entry that lived for the rest of the session.  Once the margin has passed,
-# any later write must produce a different mtime, and the entry falls out on
-# its own.
+# ordinary later writes produce a different mtime, and the entry falls out
+# on its own. Tools that preserve timestamps require an explicit Reload().
 var s_parsed: dict<dict<any>> = {}
 
 def ParseFile(file: string): dict<any>
@@ -1120,8 +1120,10 @@ export def Apply(buf: number = bufnr())
 enddef
 
 # :SimpleEditorConfigReload — the user asking for a fresh read, so the cached
-# remote answers are dropped first; the local cache checks mtimes itself.
+# local and remote answers are dropped first. Metadata checks cannot detect
+# same-sized replacements made by tools that preserve file timestamps.
 export def Reload(buf: number = bufnr())
+  s_parsed = {}
   ForgetRemote()
   Apply(buf)
 enddef

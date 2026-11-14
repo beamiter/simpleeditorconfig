@@ -803,6 +803,32 @@ assert_equal(2, &l:shiftwidth)
 g:simpleeditorconfig_enable = 1
 g:simpleeditorconfig_verbose = 0
 
+# Explicit reload must bypass metadata caches: restores/sync tools may preserve
+# an old timestamp while replacing a configuration with same-sized contents.
+if has('unix') && executable('touch')
+  var dir = BASE .. '/preserved-time'
+  mkdir(dir, 'p')
+  var config = dir .. '/.editorconfig'
+  writefile(['root = true', '[*]', 'indent_size = 2'], config)
+  system('touch -t 200001010000 ' .. shellescape(config))
+  assert_equal(0, v:shell_error, 'could not set regression timestamp')
+  var original_time = getftime(config)
+  var original_size = getfsize(config)
+  writefile(['payload'], dir .. '/data.txt')
+  execute 'edit! ' .. fnameescape(dir .. '/data.txt')
+  assert_equal(2, &l:shiftwidth)
+  writefile(['root = true', '[*]', 'indent_size = 8'], config)
+  system('touch -t 200001010000 ' .. shellescape(config))
+  assert_equal(0, v:shell_error)
+  assert_equal(original_time, getftime(config))
+  assert_equal(original_size, getfsize(config))
+  simpleeditorconfig#Apply()
+  assert_equal(2, &l:shiftwidth, 'fixture did not exercise the local cache')
+  SimpleEditorConfigReload
+  assert_equal(8, &l:shiftwidth,
+    'explicit reload reused stale metadata-matching local configuration')
+endif
+
 assert_equal(2, exists(':SimpleEditorConfigReload'))
 delete(BASE, 'rf')
 if !empty(v:errors)

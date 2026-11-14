@@ -1,8 +1,9 @@
 *simpleeditorconfig.txt*  Local and remote EditorConfig for Vim9
 
 :SimpleEditorConfigReload   Re-read configuration for the current buffer.
-                            Cached remote .editorconfig answers are dropped
-                            first, so a file edited outside Vim is seen.
+                            Cached local and remote .editorconfig answers are
+                            dropped first, including local replacements that
+                            preserve file size and modification time.
 :SimpleEditorConfigInfo     Show sources, effective properties and, when a
                             SimpleRemote workspace is connected, the
                             workspace and how the buffer relates to it
