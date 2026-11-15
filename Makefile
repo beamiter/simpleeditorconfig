@@ -1,6 +1,6 @@
-.PHONY: check defcompile test glob
+.PHONY: check defcompile test glob runtime-disable
 
-check: defcompile test glob
+check: defcompile test glob runtime-disable
 
 defcompile:
 	vim -N -u NONE -n -i NONE -es -S tests/defcompile.vim
@@ -10,3 +10,6 @@ test:
 
 glob:
 	vim -N -u NONE -n -i NONE -es -S tests/glob.vim
+
+runtime-disable:
+	vim -N -u NONE -n -i NONE -es -S tests/runtime_disable.vim

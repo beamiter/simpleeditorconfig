@@ -25,6 +25,12 @@ g:simpleeditorconfig_remote    (default 1)  Discover .editorconfig files for
                                             remote:// buffers.
 g:simpleeditorconfig_verbose   (default 0)  Report what was applied.
 
+Setting g:simpleeditorconfig_enable to 0 or false also stops save-time
+whitespace trimming and late remote replies. Disabling only
+g:simpleeditorconfig_remote stops remote discovery and late replies, not
+existing save-time rules. Neither flag restores buffer options already
+applied. Re-enable and run :SimpleEditorConfigReload to refresh configuration.
+
 The three flags accept booleans or numbers.  Invalid types fall back to their
 documented defaults.
 

@@ -943,7 +943,11 @@ def RemoteDirs(path: string, root: string): list<string>
 enddef
 
 def FinishRemote(buf: number, path: string, configs: list<dict<any>>, token: number)
-  if !bufexists(buf) || getbufvar(buf, 'simpleeditorconfig_token', -1) != token
+  # Runtime flags can change after the reads were issued, without another
+  # Apply() to advance the token. Disabled integration must not publish them.
+  if !Flag('simpleeditorconfig_enable', true)
+      || !Flag('simpleeditorconfig_remote', true)
+      || !bufexists(buf) || getbufvar(buf, 'simpleeditorconfig_token', -1) != token
     return
   endif
   var ordered = reverse(configs)
@@ -1163,7 +1167,8 @@ export def AfterWrite()
 enddef
 
 export def BeforeWrite()
-  if !get(b:, 'simpleeditorconfig_trim', false) || !&l:modifiable || &l:readonly
+  if !Flag('simpleeditorconfig_enable', true)
+      || !get(b:, 'simpleeditorconfig_trim', false) || !&l:modifiable || &l:readonly
     return
   endif
   var view = winsaveview()
