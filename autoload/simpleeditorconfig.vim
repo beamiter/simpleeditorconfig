@@ -837,86 +837,118 @@ def ProjectionRoot(path: string): string
   return UnderRoot(path, local_root) ? local_root : ''
 enddef
 
-# Remote .editorconfig files, parsed, keyed by workspace id and remote path.
-# Every remote:// buffer a project opens walks the same directories up to
-# the same workspace root, and each directory used to cost one agent
-# round-trip — the file at depth d paid d of them, serially, before its
-# options landed.  A miss is cached as well as a hit, because most
-# directories have no .editorconfig and "not there" is the answer that is
-# asked for most.
-#
-# There is no mtime to check against as there is for the local cache, so the
-# entries are dropped whenever something is known to have changed them: a
-# remote:// buffer saving a .editorconfig (BufWritePost), a tree or API
-# mutation touching one (SimpleRemoteFilesChanged), the workspace being
-# swapped for another (SimpleRemoteWorkspaceChanged) or going away
-# (SimpleRemoteDisconnected), and :SimpleEditorConfigReload, which is the
-# user asking for a re-read.  The workspace id in the key keeps a reconnect
-# from ever seeing the previous connection's answers.
+# Cache and in-flight reads share the same workspace/path identity. Keep the
+# identity fields in values so a rename or a path containing ':' cannot make
+# invalidation target another workspace.
 var s_remote_parsed: dict<dict<any>> = {}
-
-# Emptying the cache is not enough on its own, because a walk that is on the
-# wire when it happens answers afterwards with what the file said *before* the
-# change, and publishing that re-fills the cache with exactly the copy the
-# invalidation threw away — for the rest of the session, since nothing asks
-# again.  That is not a theoretical ordering either: a SimpleRemoteFilesChanged
-# from an upload's own scp job, or a SimpleRemoteWorkspaceChanged from
-# :SimpleRemoteTreeSetRoot, is emitted from somewhere other than the agent
-# channel the reads travel on, and lands between them.
-#
-# So every invalidation bumps this counter, a walk remembers the value it was
-# started under, and an answer from an older one still configures its own
-# buffer — that is what the buffer asked for — but is never published to the
-# cache, where it would configure buffers opened after the change.
+var s_remote_pending: dict<dict<any>> = {}
 var s_remote_epoch = 0
 
-def RemoteKey(workspace: dict<any>, file: string): string
-  return string(get(workspace, 'id', '')) .. ':' .. file
+def Workspace(): dict<any>
+  var ws: any = get(g:, 'simpleremote_workspace', {})
+  return type(ws) == v:t_dict ? ws : {}
+enddef
+
+def WorkspaceKey(ws: dict<any>): string
+  var id: any = get(ws, 'id', -1)
+  return type(id) == v:t_number && id >= 0
+    ? string([id, get(ws, 'kind', ''), get(ws, 'target', ''), get(ws, 'root', '')]) : ''
+enddef
+
+def RemoteKey(scope: string, file: string): string
+  return string([scope, file])
 enddef
 
 def RemoteFile(dir: string): string
   return (dir ==# '/' ? '' : dir) .. '/.editorconfig'
 enddef
 
-# Drop every cached remote .editorconfig.
+def RemoteBufferMatches(buf: number, path: string, ws: dict<any>): bool
+  if !bufloaded(buf)
+    return false
+  endif
+  var buftype = getbufvar(buf, '&buftype')
+  var remote: any = getbufvar(buf, 'vimrc_remote', {})
+  # SimpleRemote publishes an actual connection generation. Accept the
+  # metadata-less legacy binding only for that already identified workspace.
+  if (buftype !=# '' && buftype !=# 'acwrite') || type(remote) != v:t_dict
+    return false
+  endif
+  var remote_path: any = get(remote, 'path', '')
+  var generation: any = get(remote, 'generation', get(ws, 'id', -1))
+  return type(remote_path) == v:t_string && remote_path ==# path
+    && type(generation) == v:t_number && generation == get(ws, 'id', -1)
+enddef
+
+# Workspace changes, disconnect and explicit reload retire all old work.
+# Outstanding transport callbacks are not cancelled globally; their identity
+# is no longer present, so they cannot publish to any buffer or cache.
 export def ForgetRemote()
   s_remote_parsed = {}
+  s_remote_pending = {}
   s_remote_epoch += 1
 enddef
 
-# Drop the cached entries a change to `paths` may have touched: a
-# .editorconfig itself, or a directory that was created, renamed or deleted
-# with .editorconfig files somewhere under it.
-#
-# An empty cache is not a reason to return early: a walk may be in flight with
-# answers that predate this change, and the epoch is what keeps them out of
-# the cache.  It is bumped once for any report carrying a usable path, even
-# one that removed nothing — whether a directory the report names holds an
-# .editorconfig a walk is reading right now is not knowable from here, and the
-# price of assuming it does is that one walk's answers are read again.
-def ForgetRemotePaths(paths: list<string>)
-  var touched = false
+def TouchesRemoteFile(path: string, file: string): bool
+  if path =~# '\m/\.editorconfig$'
+    return path ==# file
+  endif
+  # Any other event path may be a directory. An ordinary file is not an
+  # ancestor of a candidate config, so it costs no reads or application.
+  return UnderRoot(file, path)
+enddef
+
+def AffectedRemoteFile(paths: list<string>, file: string): bool
   for path in paths
-    if type(path) != v:t_string || empty(path)
+    if TouchesRemoteFile(path, file)
+      return true
+    endif
+  endfor
+  return false
+enddef
+
+def RefreshRemotePaths(paths: list<string>, ws: dict<any>)
+  var scope = WorkspaceKey(ws)
+  if empty(scope) || empty(paths)
+    return
+  endif
+  for key in keys(s_remote_parsed)
+    var entry = s_remote_parsed[key]
+    if entry.scope ==# scope && AffectedRemoteFile(paths, entry.file)
+      remove(s_remote_parsed, key)
+    endif
+  endfor
+  for key in keys(s_remote_pending)
+    var request = s_remote_pending[key]
+    if request.scope ==# scope && AffectedRemoteFile(paths, request.file)
+      # Remove before starting its successor. A later reply for this exact
+      # key can only reach listeners registered with that successor object.
+      remove(s_remote_pending, key)
+    endif
+  endfor
+  if !Flag('simpleeditorconfig_enable', true) || !Flag('simpleeditorconfig_remote', true)
+    return
+  endif
+  var epoch = s_remote_epoch
+  for info in getbufinfo({bufloaded: 1})
+    var bound: any = getbufvar(info.bufnr, 'simpleeditorconfig_remote_binding', {})
+    if type(bound) != v:t_dict || get(bound, 'scope', '') !=# scope
+        || type(get(bound, 'path', 0)) != v:t_string
+        || type(get(bound, 'files', 0)) != v:t_list
+        || !RemoteBufferMatches(info.bufnr, bound.path, ws)
       continue
     endif
-    touched = true
-    if path =~# '/\.editorconfig$' || path ==# '.editorconfig'
-      s_remote_parsed = {}
-      s_remote_epoch += 1
-      return
-    endif
-    var prefix = substitute(path, '/\+$', '', '') .. '/'
-    for key in keys(s_remote_parsed)
-      var file = strpart(key, stridx(key, ':') + 1)
-      if stridx(file, prefix) == 0
-        remove(s_remote_parsed, key)
+    for file in bound.files
+      if !AffectedRemoteFile(paths, file)
+        continue
       endif
+      if epoch != s_remote_epoch || WorkspaceKey(Workspace()) !=# scope
+        return
+      endif
+      Apply(info.bufnr)
+      break
     endfor
   endfor
-  if touched
-    s_remote_epoch += 1
-  endif
 enddef
 
 # The directories whose .editorconfig may apply to `path`: its own, then each
@@ -942,114 +974,137 @@ def RemoteDirs(path: string, root: string): list<string>
   return dirs
 enddef
 
-def FinishRemote(buf: number, path: string, configs: list<dict<any>>, token: number)
-  # Runtime flags can change after the reads were issued, without another
-  # Apply() to advance the token. Disabled integration must not publish them.
-  if !Flag('simpleeditorconfig_enable', true)
-      || !Flag('simpleeditorconfig_remote', true)
-      || !bufexists(buf) || getbufvar(buf, 'simpleeditorconfig_token', -1) != token
-    return
+def CanFinishRemote(state: dict<any>): bool
+  if !Flag('simpleeditorconfig_enable', true) || !Flag('simpleeditorconfig_remote', true)
+      || state.epoch != s_remote_epoch
+      || getbufvar(state.buf, 'simpleeditorconfig_token', -1) != state.token
+    return false
   endif
-  var ordered = reverse(configs)
-  ApplyProperties(buf, Effective(ordered, path),
-    mapnew(ordered, (_, config) => config.path))
+  var ws = Workspace()
+  return WorkspaceKey(ws) ==# state.scope && RemoteBufferMatches(state.buf, state.path, ws)
 enddef
 
-# Once every directory has answered, keep the configs from the file's own
-# directory up to the first one that says `root = true` and apply them.
-#
-# A directory that failed to answer only matters inside the range that cut
-# keeps.  The walk asks every directory up to the workspace root at once, so
-# it also asks the ones a `root = true` further down makes irrelevant, and a
-# timeout or an unreadable directory up there says nothing about the part of
-# the picture that decides this file — the sequential walk this replaced never
-# even looked at it.  Below the cut it is the opposite: a child .editorconfig
-# without the root one it builds on is an incoherent set, worse than the
-# buffer's own defaults, so nothing is applied.
+# Wait for the bounded ancestor walk; a failure above the first root=true is
+# irrelevant, while a failure at/below it leaves settings untouched. Record
+# missing files as dependencies too: creation can change the effective rules.
 def MaybeFinish(state: dict<any>)
-  if state.done || state.answered < len(state.dirs)
+  if state.done || state.answered < len(state.files)
     return
   endif
   state.done = true
+  if !CanFinishRemote(state)
+    return
+  endif
   var configs: list<dict<any>> = []
-  for idx in range(len(state.dirs))
+  var files: list<string> = []
+  for idx in range(len(state.files))
     var entry = state.results[idx]
+    add(files, state.files[idx])
     if get(entry, 'failed', false)
       return
     endif
     if !entry.ok
       continue
     endif
-    add(configs, {dir: state.dirs[idx], path: RemoteFile(state.dirs[idx]),
-      parsed: entry.parsed})
+    add(configs, {dir: state.dirs[idx], path: state.files[idx], parsed: entry.parsed})
     if entry.parsed.root
       break
     endif
   endfor
-  FinishRemote(state.buf, state.path, configs, state.token)
+  setbufvar(state.buf, 'simpleeditorconfig_remote_binding',
+    {scope: state.scope, path: state.path, files: files})
+  var ordered = reverse(configs)
+  ApplyProperties(state.buf, Effective(ordered, state.path),
+    mapnew(ordered, (_, config) => config.path))
 enddef
 
-# One directory's answer.  The agent's "no such file" reply is `not a file:
-# <path>`; every other failure — connection closed, workspace not ready,
-# request timed out, cannot read — is recorded against that one directory and
-# left out of the cache, for MaybeFinish() to weigh against where the walk is
-# cut.
-def OnRead(state: dict<any>, idx: number, ok: bool, body: string)
+def Receive(state: dict<any>, idx: number, entry: dict<any>)
   if state.done
     return
-  endif
-  var entry: dict<any>
-  if !ok && body !~# '^not a file:'
-    entry = {ok: false, failed: true, parsed: {}}
-  else
-    entry = {ok: ok, failed: false,
-      parsed: ok ? Parse(split(body, "\n", 1)) : {}}
-    if state.epoch == s_remote_epoch
-      var key = RemoteKey(state.workspace, RemoteFile(state.dirs[idx]))
-      s_remote_parsed[key] = entry
-    endif
   endif
   state.results[idx] = entry
   state.answered += 1
   MaybeFinish(state)
 enddef
 
-# A named function so the closure captures this call's `idx` and nothing
-# else.  Returns false when the read could not even be issued.
-def IssueRead(state: dict<any>, idx: number): bool
-  var file = RemoteFile(state.dirs[idx])
-  return g:SimpleRemoteReadFile(file, (ok, body) =>
-    OnRead(state, idx, !!ok, type(body) == v:t_string ? body : string(body))) >= 0
+def OnSharedRead(key: string, request: dict<any>, ok: bool, body: string)
+  if get(s_remote_pending, key, {}) isnot request
+    return
+  endif
+  remove(s_remote_pending, key)
+  if WorkspaceKey(Workspace()) !=# request.scope
+    return
+  endif
+  # The agent's missing-file answer is cacheable. Transport errors are not.
+  var failed = !ok && body !~# '\m^not a file:'
+  var entry = {ok: ok, failed: failed, parsed: ok ? Parse(split(body, "\n", 1)) : {},
+    scope: request.scope, file: request.file}
+  if !failed
+    s_remote_parsed[key] = entry
+  endif
+  for Deliver in values(request.listeners)
+    call(Deliver, [entry])
+  endfor
 enddef
 
-# Ask for every candidate .editorconfig at once — the reads are independent,
-# so a file at depth d costs one round-trip instead of d — answering the
-# ones already cached on the spot.
-def Collect(buf: number, path: string, dirs: list<string>,
-    workspace: dict<any>, token: number)
-  var state: dict<any> = {buf: buf, path: path, dirs: dirs, token: token,
-    workspace: workspace, results: repeat([{}], len(dirs)), answered: 0,
+# A named function keeps each callback bound to its own directory index. The
+# request must be visible before ReadFile, whose callback can run synchronously.
+def IssueRead(state: dict<any>, idx: number): bool
+  var file = state.files[idx]
+  var key = RemoteKey(state.scope, file)
+  var request = get(s_remote_pending, key, {})
+  var Deliver = (entry) => Receive(state, idx, entry)
+  var listener_key = string(state.buf)
+  if !empty(request)
+    request.listeners[listener_key] = Deliver
+    return true
+  endif
+  request = {scope: state.scope, file: file, listeners: {[listener_key]: Deliver}}
+  s_remote_pending[key] = request
+  var sent = g:SimpleRemoteReadFile(file, (ok, body) =>
+    OnSharedRead(key, request, !!ok, type(body) == v:t_string ? body : string(body)))
+  if sent < 0
+    # A refusing transport normally calls back immediately. Treat a refusal
+    # without a callback as failure too, so it cannot leave an immortal key.
+    OnSharedRead(key, request, false, 'remote workspace refused the request')
+    return false
+  endif
+  return true
+enddef
+
+# Cache hits and pending requests are shared per path, not per whole walk.
+# A change to one config can join still-valid parent/child reads in progress.
+def Collect(buf: number, path: string, dirs: list<string>, scope: string, token: number)
+  var files = mapnew(dirs, (_, dir) => RemoteFile(dir))
+  var active_dirs = dirs
+  # A still-fresh cached root is sufficient to exclude higher directories,
+  # including from the reads issued after a lower file changes.
+  for idx in range(len(files))
+    var known = get(s_remote_parsed, RemoteKey(scope, files[idx]), {})
+    if !empty(known) && known.ok && known.parsed.root
+      files = files[: idx]
+      active_dirs = dirs[: idx]
+      break
+    endif
+  endfor
+  var state: dict<any> = {buf: buf, path: path, dirs: active_dirs, files: files, token: token,
+    scope: scope, results: repeat([{}], len(files)), answered: 0,
     done: false, epoch: s_remote_epoch}
-  for idx in range(len(dirs))
-    var cached = get(s_remote_parsed, RemoteKey(workspace, RemoteFile(dirs[idx])), {})
+  setbufvar(buf, 'simpleeditorconfig_remote_binding',
+    {scope: scope, path: path, files: files})
+  for idx in range(len(files))
+    var cached = get(s_remote_parsed, RemoteKey(scope, files[idx]), {})
     if !empty(cached)
       state.results[idx] = cached
       state.answered += 1
     endif
   endfor
-  for idx in range(len(dirs))
+  for idx in range(len(files))
     if !empty(state.results[idx])
       continue
     endif
-    if !IssueRead(state, idx)
-      # Refused outright: the workspace is not ready, so the directories not
-      # asked for yet would be refused too and nothing is applied.
+    if !IssueRead(state, idx) || state.done
       state.done = true
-      return
-    endif
-    if state.done
-      # Every directory answered on the spot and the walk has already
-      # finished.
       return
     endif
   endfor
@@ -1061,9 +1116,10 @@ def ApplyRemote(buf: number, path: string, token: number)
       || !exists('*g:SimpleRemoteReadFile')
     return
   endif
-  var workspace = get(g:, 'simpleremote_workspace', {})
-  if type(workspace) != v:t_dict
-    workspace = {}
+  var workspace = Workspace()
+  var scope = WorkspaceKey(workspace)
+  if empty(scope) || !RemoteBufferMatches(buf, path, workspace)
+    return
   endif
   var configured_root: any = get(workspace, 'root', '')
   var root = type(configured_root) == v:t_string
@@ -1074,7 +1130,7 @@ def ApplyRemote(buf: number, path: string, token: number)
   if !UnderRoot(path, root)
     return
   endif
-  Collect(buf, path, RemoteDirs(path, root), workspace, token)
+  Collect(buf, path, RemoteDirs(path, root), scope, token)
 enddef
 
 export def Apply(buf: number = bufnr())
@@ -1095,6 +1151,7 @@ export def Apply(buf: number = bufnr())
   s_generation += 1
   var token = s_generation
   setbufvar(buf, 'simpleeditorconfig_token', token)
+  setbufvar(buf, 'simpleeditorconfig_remote_binding', {})
   var buftype = getbufvar(buf, '&buftype')
   if !Flag('simpleeditorconfig_enable', true)
       || (buftype !=# '' && buftype !=# 'acwrite')
@@ -1133,36 +1190,58 @@ export def Reload(buf: number = bufnr())
 enddef
 
 export def ApplyRemoteEvent()
-  var event = get(g:, 'simpleremote_event', {})
-  if get(event, 'type', '') ==# 'buffer-read'
-    Apply(get(event, 'bufnr', -1))
+  var event: any = get(g:, 'simpleremote_event', {})
+  if type(event) != v:t_dict || get(event, 'type', '') !=# 'buffer-read'
+    return
+  endif
+  var announced: any = get(event, 'workspace', {})
+  if type(announced) != v:t_dict || WorkspaceKey(announced) !=# WorkspaceKey(Workspace())
+    return
+  endif
+  var buf: any = get(event, 'bufnr', -1)
+  if type(buf) == v:t_number && buf > 0
+    Apply(buf)
   endif
 enddef
 
-# User SimpleRemoteFilesChanged: a tree, upload or API mutation.  Only a
-# change that can have touched a .editorconfig costs anything.
+# Only changes from the currently active connection can retarget a walk;
+# compare producer identity rather than interpreting a same-named path alone.
 export def OnRemoteFilesChanged()
-  var event = get(g:, 'simpleremote_event', {})
-  var changes = get(event, 'changes', [])
-  if type(changes) != v:t_list
+  var event: any = get(g:, 'simpleremote_event', {})
+  if type(event) != v:t_dict
+    return
+  endif
+  var ws = Workspace()
+  var announced: any = get(event, 'workspace', {})
+  var changes: any = get(event, 'changes', [])
+  if type(announced) != v:t_dict || WorkspaceKey(announced) !=# WorkspaceKey(ws)
+      || type(changes) != v:t_list
     return
   endif
   var paths: list<string> = []
   for change in changes
-    if type(change) == v:t_dict && type(get(change, 'path', '')) == v:t_string
-      add(paths, get(change, 'path', ''))
+    if type(change) != v:t_dict
+      continue
+    endif
+    var path: any = get(change, 'path', '')
+    if type(path) == v:t_string && stridx(path, '/') == 0
+      var normalized = substitute(path, '\m/\+$', '', '')
+      add(paths, empty(normalized) ? '/' : normalized)
     endif
   endfor
-  ForgetRemotePaths(paths)
+  RefreshRemotePaths(paths, ws)
 enddef
 
-# BufWritePost: a remote:// buffer that saved a .editorconfig has just made
-# the cached copy of it stale.  Local .editorconfig files are covered by the
-# mtime check in ParseFile().
+# BufWritePost: associate the saved config with the actual buffer connection,
+# then invalidate only that path and re-apply to its affected loaded files.
 export def AfterWrite()
-  var remote = get(b:, 'vimrc_remote', {})
-  if type(remote) == v:t_dict && get(remote, 'path', '') =~# '/\.editorconfig$'
-    ForgetRemotePaths([remote.path])
+  var remote: any = get(b:, 'vimrc_remote', {})
+  var path: any = type(remote) == v:t_dict ? get(remote, 'path', '') : ''
+  var ws = Workspace()
+  if type(path) == v:t_string && stridx(path, '/') == 0
+      && path ==# RemoteFile(fnamemodify(path, ':h'))
+      && RemoteBufferMatches(bufnr(), path, ws)
+    RefreshRemotePaths([path], ws)
   endif
 enddef
 

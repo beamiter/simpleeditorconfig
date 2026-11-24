@@ -12,14 +12,15 @@ plain local EditorConfig implementation.
 * **Virtual mode (`remote://` buffers).**  `.editorconfig` files are
   discovered asynchronously through `g:SimpleRemoteReadFile()` — the plugin
   never mounts or shells out to read configuration.  Every directory from the
-  file's own up to the workspace root is asked at once, so a file at any depth
+  file's own up to the first cached `root = true` or the workspace root is
+  asked at once, so a file at any depth
   costs one round-trip, and the parsed answers (hits and misses) are cached per
-  workspace.  The cache is dropped when a `remote://` buffer saves a
-  `.editorconfig`, when SimpleRemote reports a tree/upload/API change touching
-  one (`SimpleRemoteFilesChanged`), when the workspace changes or disconnects,
-  and by `:SimpleEditorConfigReload`; answers from a walk that was already on
-  the wire when that happened configure their own buffer but are never cached,
-  so an invalidation is not undone by a late reply.  The walk never leaves the
+  workspace and configuration path. Overlapping walks share pending reads.
+  A save or SimpleRemoteFilesChanged event invalidates only the affected paths
+  in the current workspace and refreshes affected loaded buffers. Late
+  replies to superseded reads cannot configure buffers or refill the cache.
+  Workspace change, disconnect and :SimpleEditorConfigReload clear the
+  complete remote cache. The walk never leaves the
   workspace root, and a transport failure at or below the first `root = true`
   applies nothing rather than a partial set (above it, the failed directory
   was going to be discarded anyway).  SimpleRemote fires `BufWritePre` for

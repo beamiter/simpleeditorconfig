@@ -44,26 +44,23 @@ remote:// buffers are filled by SimpleRemote through a BufReadCmd, which
 suppresses BufReadPost, so the plugin applies on |User| SimpleRemoteBufferRead
 instead ({type: 'buffer-read', bufnr, ...} in g:simpleremote_event).  The
 .editorconfig files are discovered through g:SimpleRemoteReadFile(): every
-directory from the file's own up to g:simpleremote_workspace.root is asked at
-once, so a file at any depth costs one round-trip rather than one per level,
+directory from the file's own up to the first cached root = true or
+g:simpleremote_workspace.root is asked at once, so a file at any depth costs one round-trip rather than one per level,
 and the answers — hits and "not a file" misses alike — are cached per
 workspace.  The walk is cut at the first `root = true` and never leaves the
 workspace root.
 
-The cache is dropped when a remote:// buffer saves a .editorconfig
-(BufWritePost), when SimpleRemoteFilesChanged reports a created, changed or
-deleted .editorconfig or a directory that may hold one, on
-SimpleRemoteWorkspaceChanged and SimpleRemoteDisconnected, and by
-:SimpleEditorConfigReload.  A walk that was already on the wire when one of
-those arrived — or when any other SimpleRemoteFilesChanged did, since a
-directory it names may hold the .editorconfig the walk is reading — still
-configures its own buffer with the answers it asked for, but they are not
-cached: they describe the file as it was before the change, and every buffer
-opened afterwards would be configured from them.
+One read for a workspace and configuration path can serve several overlapping
+walks. A remote:// .editorconfig save (BufWritePost) or a change event for the
+current workspace invalidates only the affected .editorconfig paths and
+reapplies affected loaded buffers. Late superseded replies cannot update
+buffers or cache entries. A different workspace's events do not retarget
+current buffers. Workspace change, disconnect and :SimpleEditorConfigReload
+clear the complete remote cache and retire all pending walks.
 
 A read that fails for any reason other than "no such file" — connection
 closed, workspace not ready, request timed out — is weighed against where the
-walk is cut.  Every directory up to the workspace root is asked at once,
+walk is cut. If no cached root is available, directories are asked at once,
 including the ones a `root = true` further down makes irrelevant, so a failure
 above the cut costs nothing and the walk applies.  A failure at or below the
 cut applies nothing at all: a partial set (a child .editorconfig without the

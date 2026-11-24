@@ -304,6 +304,8 @@ g:remote_editorconfigs = {
 }
 g:remote_editorconfig_reads = []
 g:remote_async = false
+g:remote_hold = false
+g:remote_callbacks = []
 g:remote_fail = {}
 g:remote_refuse = false
 def g:SimpleRemoteReadFile(path: string, Callback: func): number
@@ -318,7 +320,9 @@ def g:SimpleRemoteReadFile(path: string, Callback: func): number
     ok = false
     body = g:remote_fail[path]
   endif
-  if g:remote_async
+  if g:remote_hold
+    add(g:remote_callbacks, {path: path, ok: ok, body: body, callback: Callback})
+  elseif g:remote_async
     timer_start(5, (_) => call(Callback, [ok, body]))
   else
     call(Callback, [ok, body])
@@ -437,24 +441,27 @@ RemoteBuffer('/workspace/src/lib/a.py')
 FireBufferRead(bufnr())
 assert_equal(reads_before, len(g:remote_editorconfig_reads),
   'an unrelated change must not empty the cache')
+reads_before = len(g:remote_editorconfig_reads)
 Fire('SimpleRemoteFilesChanged', {changes: [
   {path: '/workspace/src', type: 'deleted'}],
   workspace: copy(g:simpleremote_workspace)})
-reads_before = len(g:remote_editorconfig_reads)
-RemoteBuffer('/workspace/src/lib/b.py')
-FireBufferRead(bufnr())
 assert_equal([
   '/workspace/src/lib/.editorconfig', '/workspace/src/.editorconfig',
 ], g:remote_editorconfig_reads[reads_before :],
-  'a deleted directory drops the entries under it and keeps the root')
+  'affected open buffer re-reads entries under the directory and keeps its root')
+reads_before = len(g:remote_editorconfig_reads)
+RemoteBuffer('/workspace/src/lib/b.py')
+FireBufferRead(bufnr())
+assert_equal(reads_before, len(g:remote_editorconfig_reads))
 Fire('SimpleRemoteFilesChanged', {changes: [
   {path: '/workspace/.editorconfig', type: 'created'}],
   workspace: copy(g:simpleremote_workspace)})
+assert_equal(['/workspace/.editorconfig'], g:remote_editorconfig_reads[reads_before :],
+  'a .editorconfig event re-reads exactly that path, including a prior miss')
 reads_before = len(g:remote_editorconfig_reads)
 RemoteBuffer('/workspace/src/lib/c.py')
 FireBufferRead(bufnr())
-assert_equal(3, len(g:remote_editorconfig_reads) - reads_before,
-  'a created .editorconfig drops the whole cache')
+assert_equal(reads_before, len(g:remote_editorconfig_reads))
 
 # SimpleRemoteWorkspaceChanged and SimpleRemoteDisconnected empty the cache.
 Fire('SimpleRemoteWorkspaceChanged', {snapshot: copy(g:simpleremote_workspace)})
@@ -484,6 +491,23 @@ FireBufferRead(bufnr())
 assert_equal(['/workspace/src/.editorconfig'], b:simpleeditorconfig_sources)
 assert_equal(5, &l:shiftwidth)
 assert_equal(5, &l:tabstop, 'tab_width above the root must not apply')
+reads_before = len(g:remote_editorconfig_reads)
+var rooted_token = get(b:, 'simpleeditorconfig_token')
+Fire('SimpleRemoteFilesChanged', {changes: [
+  {path: '/workspace/.editorconfig', type: 'changed'}],
+  workspace: copy(g:simpleremote_workspace)})
+assert_equal(reads_before, len(g:remote_editorconfig_reads), 'root cut ignores an ancestor change')
+assert_equal(rooted_token, get(b:, 'simpleeditorconfig_token'))
+# The missing config below the root was cached; creating it must refresh the
+# already open buffer, not merely become visible to the next open.
+var child_config = '/workspace/src/lib/.editorconfig'
+g:remote_editorconfigs[child_config] = "[*.py]\nindent_size = 12"
+Fire('SimpleRemoteFilesChanged', {changes: [{path: child_config, type: 'created'}],
+  workspace: copy(g:simpleremote_workspace)})
+assert_equal([child_config], g:remote_editorconfig_reads[reads_before :],
+  'a direct negative-cache refresh does not fetch above a known root')
+assert_equal(12, &l:shiftwidth)
+remove(g:remote_editorconfigs, child_config)
 g:remote_editorconfigs['/workspace/src/.editorconfig'] = join([
   '[*.py]', 'indent_style = space', 'indent_size = 3',
 ], "\n")
@@ -505,15 +529,14 @@ assert_equal(['/workspace/src/.editorconfig'],
   'a failure above the root cut must not discard the walk')
 assert_equal(5, &l:shiftwidth)
 assert_true(&l:expandtab)
-# What answered is cached and what failed is not, so the next buffer in the
-# same directory asks for the failed directory alone.
+# A proven cached root means the next buffer in the same directory no
+# longer asks for the failed directory above the root.
 g:remote_fail = {}
 reads_before = len(g:remote_editorconfig_reads)
 RemoteBuffer('/workspace/src/lib/reasked.py')
 FireBufferRead(bufnr())
-assert_equal(['/workspace/.editorconfig'],
-  g:remote_editorconfig_reads[reads_before :],
-  'a failed read must not be cached, and an answered one must not be re-read')
+assert_equal(reads_before, len(g:remote_editorconfig_reads),
+  'a cached root cuts out even a previously failed ancestor')
 assert_equal(5, &l:shiftwidth)
 g:remote_editorconfigs['/workspace/src/.editorconfig'] = join([
   '[*.py]', 'indent_style = space', 'indent_size = 3',
@@ -564,11 +587,12 @@ simpleeditorconfig#ForgetRemote()
 var sbuf = RemoteBuffer('/workspace/src/lib/super.py')
 setlocal shiftwidth=7
 FireBufferRead(sbuf)
-# The first walk captured indent_size = 3; the second, started before any
-# answer arrived, sees indent_size = 4 and must be the one that wins.
+# The first walk captured indent_size = 3. An explicit invalidation
+# distinguishes the newer data from otherwise coalescible requests.
 g:remote_editorconfigs['/workspace/src/.editorconfig'] = join([
   '[*.py]', 'indent_style = space', 'indent_size = 4',
 ], "\n")
+simpleeditorconfig#ForgetRemote()
 FireBufferRead(sbuf)
 assert_true(WaitFor(() => getbufvar(sbuf, '&shiftwidth') != 7))
 sleep 50m
@@ -613,59 +637,96 @@ assert_true(WaitFor(() => getbufvar(malformed_flag_buf, '&shiftwidth') == 4),
   'a mistyped remote flag did not fall back to enabled')
 g:simpleeditorconfig_remote = 1
 
-# An invalidation that lands while a walk is on the wire must not be undone by
-# that walk's late answers: they carry what the file said before the change,
-# they may still configure the buffer that asked for them, and they must never
-# reach the cache, where every buffer opened afterwards would read them.
+# Hold exact transport callbacks to prove both arrival orders, without timer
+# guesses. Only the changed config re-reads; warm/negative/other in-flight
+# paths and foreign workspace events are not invalidated.
+set hidden
 g:remote_editorconfigs['/workspace/src/.editorconfig'] = join([
   '[*.py]', 'indent_style = space', 'indent_size = 3',
 ], "\n")
 simpleeditorconfig#ForgetRemote()
+g:remote_async = false
+var untouched = RemoteBuffer('/workspace/docs/untouched.py')
+FireBufferRead(untouched)
+setlocal shiftwidth=11
+var unrelated_token = getbufvar(untouched, 'simpleeditorconfig_token')
+g:remote_hold = true
+g:remote_callbacks = []
 reads_before = len(g:remote_editorconfig_reads)
 var rbuf = RemoteBuffer('/workspace/src/lib/race.py')
 setlocal shiftwidth=7
 FireBufferRead(rbuf)
-assert_equal(3, len(g:remote_editorconfig_reads) - reads_before,
-  'the reads must be on the wire when the change lands')
-# They are; the file changes remotely now, before any of them answers.
-g:remote_editorconfigs['/workspace/src/.editorconfig'] = join([
-  '[*.py]', 'indent_style = space', 'indent_size = 6',
-], "\n")
-Fire('SimpleRemoteFilesChanged', {changes: [
-  {path: '/workspace/src/.editorconfig', type: 'changed'}],
-  workspace: copy(g:simpleremote_workspace)})
-assert_true(WaitFor(() => getbufvar(rbuf, '&shiftwidth') != 7))
-assert_equal(3, getbufvar(rbuf, '&shiftwidth'),
-  'the buffer applies the answers it asked for')
-sleep 20m
-g:remote_async = false
+var shared = RemoteBuffer('/workspace/src/lib/also_open.py')
+setlocal shiftwidth=9
+FireBufferRead(shared)
+var independent = RemoteBuffer('/workspace/notes/pending.py')
+setlocal shiftwidth=10
+FireBufferRead(independent)
+assert_equal([
+  '/workspace/src/lib/.editorconfig', '/workspace/src/.editorconfig',
+  '/workspace/notes/.editorconfig',
+], g:remote_editorconfig_reads[reads_before :], 'overlapping walks share pending files')
+var foreign = extend(copy(g:simpleremote_workspace), {id: 77})
+var target_path = '/workspace/src/.editorconfig'
+var change = [{path: target_path, type: 'changed'}]
+reads_before = len(g:remote_editorconfig_reads)
+Fire('SimpleRemoteFilesChanged', {changes: change, workspace: foreign})
+assert_equal(reads_before, len(g:remote_editorconfig_reads), 'foreign notification must not read')
+# Same path, three distinct generations; the oldest is delivered before the
+# newest, the middle one after. Only the shared current request may publish.
+g:remote_editorconfigs[target_path] = "[*.py]\nindent_style = space\nindent_size = 4"
+Fire('SimpleRemoteFilesChanged', {changes: change, workspace: copy(g:simpleremote_workspace)})
+g:remote_editorconfigs[target_path] = "[*.py]\nindent_style = space\nindent_size = 6"
+Fire('SimpleRemoteFilesChanged', {changes: change, workspace: copy(g:simpleremote_workspace)})
+assert_equal([target_path, target_path], g:remote_editorconfig_reads[reads_before :])
+assert_equal(5, len(g:remote_callbacks))
+# Child + stale original + unaffected path finish before fresh config.
+for idx in [0, 1, 2]
+  var item = g:remote_callbacks[idx]
+  call(item.callback, [item.ok, item.body])
+endfor
+assert_equal(7, getbufvar(rbuf, '&shiftwidth'), 'stale reply did not publish to original buffer')
+assert_equal(9, getbufvar(shared, '&shiftwidth'), 'stale reply did not publish to shared buffer')
+assert_true(index(getbufvar(independent, 'simpleeditorconfig_sources', []),
+  '/workspace/.editorconfig') >= 0, 'unrelated in-flight negative miss must complete')
+for idx in [4, 3]
+  var item = g:remote_callbacks[idx]
+  call(item.callback, [item.ok, item.body])
+endfor
+assert_equal(6, getbufvar(rbuf, '&shiftwidth'))
+assert_equal(6, getbufvar(shared, '&shiftwidth'))
+assert_equal(11, getbufvar(untouched, '&shiftwidth'), 'unrelated buffer must not re-apply')
+assert_equal(unrelated_token, getbufvar(untouched, 'simpleeditorconfig_token'))
+g:remote_hold = false
 reads_before = len(g:remote_editorconfig_reads)
 RemoteBuffer('/workspace/src/lib/after_race.py')
 FireBufferRead(bufnr())
-assert_equal(3, len(g:remote_editorconfig_reads) - reads_before,
-  'answers that raced an invalidation must not be cached')
-assert_equal(6, &l:shiftwidth, 'the next buffer must see the new file')
-g:remote_editorconfigs['/workspace/src/.editorconfig'] = join([
-  '[*.py]', 'indent_style = space', 'indent_size = 3',
-], "\n")
+assert_equal(reads_before, len(g:remote_editorconfig_reads), 'new buffer reuses the fresh generation')
+assert_equal(6, &l:shiftwidth)
+set nohidden
+g:remote_editorconfigs[target_path] = "[*.py]\nindent_style = space\nindent_size = 3"
 simpleeditorconfig#ForgetRemote()
 
-# The same holds for the events that empty the whole cache — a workspace
-# swapped for another, a disconnect, :SimpleEditorConfigReload: a walk that
-# was in flight must not re-fill what they threw away.
+# Full workspace transitions also retire pending replies, without applying
+# old contents to an open buffer or re-reading it in a different connection.
 g:remote_async = true
 reads_before = len(g:remote_editorconfig_reads)
 var wbuf = RemoteBuffer('/workspace/src/lib/swapped.py')
 setlocal shiftwidth=7
 FireBufferRead(wbuf)
-assert_equal(3, len(g:remote_editorconfig_reads) - reads_before,
-  'the reads must be on the wire when the workspace changes')
+assert_equal(3, len(g:remote_editorconfig_reads) - reads_before)
+var current_ws = g:simpleremote_workspace
+g:simpleremote_workspace = extend(copy(current_ws), {id: 8})
 Fire('SimpleRemoteWorkspaceChanged', {snapshot: copy(g:simpleremote_workspace)})
-assert_true(WaitFor(() => getbufvar(wbuf, '&shiftwidth') == 3))
-sleep 20m
+sleep 30m
+assert_equal(7, getbufvar(wbuf, '&shiftwidth'), 'old workspace reply must not publish')
 assert_match('remote cache: 0 file(s)',
-  execute('call simpleeditorconfig#Health()'),
-  'answers from before the invalidation must stay out of the cache')
+  execute('call simpleeditorconfig#Health()'), 'old workspace reply must not re-fill cache')
+reads_before = len(g:remote_editorconfig_reads)
+FireBufferRead(wbuf)
+assert_equal(reads_before, len(g:remote_editorconfig_reads),
+  'old buffer generation must not read a same path in the new workspace')
+g:simpleremote_workspace = current_ws
 g:remote_async = false
 
 # Info and Health name the workspace.
